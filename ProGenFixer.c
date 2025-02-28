@@ -1629,13 +1629,14 @@ void usage(int k, int n_thread, int min_cov, int insert_size, float error_rate) 
         fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
         fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
         fprintf(stderr, "  -t INT     number of threads for k-mer counting (default [%d])\n", n_thread);
+        fprintf(stderr, "  --fix [FILE]  Correct reference genome using detected variants (default: fixed_reference.fna)\n");
         fprintf(stderr, "\nSample commands:\n ");
         fprintf(stderr, "\nProGenFixer  ref_genome.fa reads.fq  > output.vcf\n ");
         fprintf(stderr, "\nProGenFixer  ref_genome.fa reads1.fq reads2.fq > output.vcf\n ");
         fprintf(stderr, "\nProGenFixer ref_genome.fa reads1.fq reads2.fq reads3.fq > output.vcf\n ");
+    
         //fprintf(stderr, "  -e INT     percentages of sequencing error rate (for P-value calculation, default [%g])\n", error_rate);
         fprintf(stderr, "\n");
-        fprintf(stderr, "  --fix [FILE]  Correct reference genome using detected variants (default: fixed_reference.fna)\n");
         return;
 }
 
