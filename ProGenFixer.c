@@ -1860,7 +1860,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
     fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_file);
 }
 
-// Add reverse comparison function
+// Add reverse comparison function 
 int reverse_compare(const void *a, const void *b) {
     const variation_t *va = (const variation_t *)a;
     const variation_t *vb = (const variation_t *)b;

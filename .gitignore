@@ -1,3 +1,4 @@
 .*.swp
 kcov
-ProGenFixer.c
+ProGenFixer
+*.c.bak
