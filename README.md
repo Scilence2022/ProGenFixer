@@ -6,7 +6,7 @@ ProGenFixer is a tool for detecting and correcting variants in prokaryotic genom
 
 - Fast variant detection without read mapping
 - Supports substitutions, insertions, and deletions
-- Automatic reference genome correction
+- Automatic reference genome correction with iterative refinement
 - Multi-threaded k-mer counting for improved performance
 - Works with various input formats (FASTA, FASTQ, gzipped files)
 
@@ -22,7 +22,7 @@ ProGenFixer is a tool for detecting and correcting variants in prokaryotic genom
 
 1. Clone the repository:
    ```
-   git clone https://github.com/username/ProGenFixer.git
+   git clone https://github.com/Scilence2022/ProGenFixer.git
    cd ProGenFixer
    ```
 
@@ -38,13 +38,13 @@ This will create the `ProGenFixer` executable in the current directory.
 ### Basic Usage
 
 ```
-ProGenFixer [options] Reference NGS_files > output.vcf
+ProGenFixer [options] Reference NGS_files
 ```
 
 Where:
 - `Reference` is the path to your reference genome in FASTA format
 - `NGS_files` are one or more NGS data files (FASTQ/FASTA, can be gzipped)
-- The output is directed to a VCF file
+- Output VCF files are specified by the `-o` option
 
 ### Options
 
@@ -52,36 +52,53 @@ Where:
 - `-c INT` : minimal k-mer coverage for variant calling (default: 3)
 - `-l INT` : maximal assembly length (default: 1000)
 - `-t INT` : number of threads for k-mer counting (default: 3)
+- `-o STR` : base name for output files (required)
+- `-n INT` : number of correction iterations (default: 2)
 - `--fix [FILE]` : Correct reference genome using detected variants (default output: fixed_reference.fna)
 
 ### Examples
 
 1. Basic variant detection:
    ```
-   ProGenFixer ref_genome.fa reads.fq > variants.vcf
+   ProGenFixer -o output ref_genome.fa reads.fq
    ```
 
 2. Using paired-end reads:
    ```
-   ProGenFixer ref_genome.fa reads1.fq reads2.fq > variants.vcf
+   ProGenFixer -o output ref_genome.fa reads1.fq reads2.fq
    ```
 
 3. Using multiple read files:
    ```
-   ProGenFixer ref_genome.fa reads1.fq reads2.fq reads3.fq > variants.vcf
+   ProGenFixer -o output ref_genome.fa reads1.fq reads2.fq reads3.fq
    ```
 
 4. Fixing the reference genome:
    ```
-   ProGenFixer --fix ref_genome.fa reads.fq > variants.vcf
+   ProGenFixer -o output --fix ref_genome.fa reads.fq
    ```
 
 5. Fixing the reference genome with a custom output file:
    ```
-   ProGenFixer --fix=corrected_genome.fa ref_genome.fa reads.fq > variants.vcf
+   ProGenFixer -o output --fix=corrected_genome.fa ref_genome.fa reads.fq
    ```
 
-## Output Format
+6. Using multiple correction iterations:
+   ```
+   ProGenFixer -o output -n 3 --fix ref_genome.fa reads.fq
+   ```
+
+## Output Files
+
+ProGenFixer generates multiple output files:
+
+1. VCF files for each iteration: `<output_base>.iter<N>.vcf`
+2. Corrected reference files for each iteration: `<output_base>.iter<N>.fasta`
+3. Final corrected reference genome after all iterations
+
+Where `<output_base>` is the value specified with `-o` option, and `<N>` is the iteration number.
+
+## VCF Format
 
 ProGenFixer outputs variants in VCF format. The columns are:
 
@@ -101,7 +118,8 @@ ProGenFixer uses a k-mer based approach to identify variants:
 1. It builds a k-mer database from the NGS reads
 2. It analyzes the reference genome to find regions where k-mer coverage drops
 3. It identifies the specific variants by comparing k-mer patterns
-4. It can apply these variants to create a corrected reference genome
+4. It applies these variants to create a corrected reference genome
+5. It can perform multiple iterations of correction to refine the results
 
 This approach is particularly effective for prokaryotic genomes, which are typically haploid and have less complex variation patterns than eukaryotic genomes.
 
