@@ -54,7 +54,6 @@ const unsigned char seq_nt4_table[256] = { // translate ACGT to 0123
         4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
         4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
         4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
-        4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
         4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4
 };
 
@@ -645,6 +644,8 @@ typedef struct { // data structure for file evaluation
     int k;
     int p;
     var_location *var_locs;
+    FILE *vcf_out;
+    int iteration;
 } evaluation_t;
 
 typedef struct path_node {
@@ -946,16 +947,16 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     // fprintf(stdout, "slim_path_len: %d\t", slim_path_len);
     // fprintf(stdout, "ref_seq_len: %d\n", ref_seq_len);
 
-    fprintf(stdout, "%s\t",eva->var_locs[var_loc_p].name);
+    fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
     if(slim_path_len >= ref_seq_len){
         kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
         kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
-        fprintf(stdout, "%d\t", ref_var.pos_s + k + 1); 
-        fprintf(stdout, ".\t");
-        fprintf(stdout, "%s\t", ref_seq);
-        fprintf(stdout, "%s\t", path_seq);
-        fprintf(stdout, "%d\t", path_cov);
-        if(slim_path_len > ref_seq_len){fprintf(stdout, "INS\t"); }else{fprintf(stdout, "SUB\t"); }
+        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k + 1); 
+        fprintf(eva->vcf_out, ".\t");
+        fprintf(eva->vcf_out, "%s\t", ref_seq);
+        fprintf(eva->vcf_out, "%s\t", path_seq);
+        fprintf(eva->vcf_out, "%d\t", path_cov);
+        if(slim_path_len > ref_seq_len){fprintf(eva->vcf_out, "INS\t"); }else{fprintf(eva->vcf_out, "SUB\t"); }
 
     }
     if(slim_path_len < ref_seq_len){ //Deletion
@@ -970,14 +971,14 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
         //kms_to_seq(ref_seq, eva->kms, ref_var.pos_s, ref_var.pos_t - k + 1 );
-        fprintf(stdout, "%d\t", ref_var.pos_s + k );
-        fprintf(stdout, ".\t");
-        fprintf(stdout, "%s\t", ref_seq);
-        fprintf(stdout, "%s", path_seq); 
-        fprintf(stdout, "\t%d\t", path_cov);
-        fprintf(stdout, "DEL\t");
+        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k );
+        fprintf(eva->vcf_out, ".\t");
+        fprintf(eva->vcf_out, "%s\t", ref_seq);
+        fprintf(eva->vcf_out, "%s", path_seq); 
+        fprintf(eva->vcf_out, "\t%d\t", path_cov);
+        fprintf(eva->vcf_out, "DEL\t");
     }
-    //fprintf(stdout, "\n");
+    fprintf(eva->vcf_out, "\n");
     
     // fprintf(stdout, "##### ref_var.pos_s: %d \t", ref_var.pos_s);
     // fprintf(stdout, " ref_var.pos_t: %d \t", ref_var.pos_t);
@@ -1630,6 +1631,8 @@ void usage(int k, int n_thread, int min_cov, int insert_size, float error_rate) 
         fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
         fprintf(stderr, "  -t INT     number of threads for k-mer counting (default [%d])\n", n_thread);
         fprintf(stderr, "  --fix [FILE]  Correct reference genome using detected variants (default: fixed_reference.fna)\n");
+        fprintf(stderr, "  -o STR     base name for output files [required]\n");
+        fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
         fprintf(stderr, "\nSample commands:\n ");
         fprintf(stderr, "\nProGenFixer  ref_genome.fa reads.fq  > output.vcf\n ");
         fprintf(stderr, "\nProGenFixer  ref_genome.fa reads1.fq reads2.fq > output.vcf\n ");
@@ -1644,6 +1647,8 @@ int main(int argc, char *argv[])
 {
     int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, insert_size = 1000;
     float error_rate = 0.025f;
+    int num_iters = 2;  // Default number of iterations
+    char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
     int fix_enabled = 0;
@@ -1653,13 +1658,14 @@ int main(int argc, char *argv[])
     };
     char *fix_output = "fixed_reference.fna";  // Default output name
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:l:e:", long_options)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:l:e:o:n:", long_options)) >= 0) {
         if (c == 'k') k = atoi(o.arg);
         //else if (c == 'p') p = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
+        else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
         else if (c == 128) {  // Handle --fix
             fix_enabled = 1;
             if (o.arg) {
@@ -1673,6 +1679,7 @@ int main(int argc, char *argv[])
                 fix_output = def;
             }
         }
+        else if (c == 'o') output_base = o.arg;
     }
 
     if (argc - o.ind < 2) {
@@ -1680,6 +1687,10 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (!output_base) {
+        fprintf(stderr, "Error: Output base name (-o) is required\n");
+        return 1;
+    }
 
     fprintf(stderr, "k-mer size: %d\n", k);
     fprintf(stderr, "Counting k-mers of NGS file 1  ......\n");
@@ -1713,40 +1724,75 @@ int main(int argc, char *argv[])
     eva.var_capacity = 0;
     eva.variations = NULL;
 
+    char *current_ref = argv[o.ind];
+    for (int iter = 1; iter <= num_iters; iter++) {
+        // Open VCF output for this iteration
+        char vcf_fn[256];
+        snprintf(vcf_fn, sizeof(vcf_fn), "%s.iter%d.vcf", output_base, iter);
+        FILE *vcf_fp = fopen(vcf_fn, "w");
+        fprintf(vcf_fp, "##fileformat=VCF\n#CHROM\tPOS\tID\tREF\tALT\tk-mer coverage\tType\tAdditional info\n");
 
-    fprintf(stdout, "##fileformat=VCF\n#CHROM\tPOS\tID\tREF\tALT\tk-mer coverage\tType\tAdditional info\n");
-    analysis_ref_seq(&eva, argv[o.ind], insert_size, min_cov);
+        // Count current reference k-mers
+        kc_c4x_t *hr = count_file(current_ref, k, p, block_size, n_thread);
 
+        // Initialize evaluation struct
+        eva.vcf_out = vcf_fp;
+        eva.iteration = iter;
 
-//Cleaning memories....
-    for(i = 0; i < 1<<p; ++i) {
-        kc_c4_destroy(h->h[i]);
-        //kc_c4_destroy(eva.h->h[i]);
+        // Run analysis
+        analysis_ref_seq(&eva, current_ref, insert_size, min_cov);
+        fclose(vcf_fp);
+
+        // Apply corrections
+        char new_ref[256];
+        snprintf(new_ref, sizeof(new_ref), "%s.iter%d.fasta", output_base, iter);
+        apply_variations(&eva, current_ref, new_ref);
+
+        // Don't free current_ref on first iteration
+        if (iter > 1) {
+            free(current_ref);
+        }
+        current_ref = strdup(new_ref);
+        fprintf(stderr, "current_ref: %s\n", current_ref);
+        
+        // Reset evaluation struct for the next iteration
+        eva.fix_enabled = fix_enabled;
+        
+        // Free previously allocated variations array before resetting
+        if (eva.variations != NULL) {
+            free(eva.variations);
+            eva.variations = NULL;
+        }
+        
+        eva.var_count = 0;
+        eva.var_capacity = 0;
+        // eva.variations = NULL; // This line is replaced with the proper free above
+
+        // Update the reference file for the next iteration
+        // ... cleanup hr ...
     }
 
-    free(h->h); free(h);
-    // free(hr->h); free(hr);
-    //free(&eva); 
-
-    if (fix_enabled) {
-        apply_variations(&eva, argv[o.ind], fix_output);  // Pass filename
-    }
-
+    // ... final cleanup ...
     return 0;
 }
 
 // New function to apply variations
-void apply_variations(evaluation_t *eva, const char *ref_file, const char *output_file) {
+void apply_variations(evaluation_t *eva, const char *ref_file, const char *output_base) {
+    // Don't append iteration number again - it's already in output_base
+    char *output_fn = strdup(output_base);
+    
     gzFile fp = gzopen(ref_file, "r");
     if (!fp) {
         fprintf(stderr, "Failed to open reference file %s\n", ref_file);
+        free(output_fn);
         return;
     }
 
     kseq_t *seq = kseq_init(fp);
-    FILE *out_fp = fopen(output_file, "w");
+    FILE *out_fp = fopen(output_fn, "w");
     if (!out_fp) {
-        fprintf(stderr, "Failed to open output file %s\n", output_file);
+        fprintf(stderr, "Failed to open output file %s\n", output_fn);
+        free(output_fn);
         return;
     }
 
@@ -1851,14 +1897,15 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
         fprintf(stderr, "Final sequence start: '%.50s...'\n", sequence);
 
         // Write modified sequence to output
-        fprintf(out_fp, ">%s\n%s\n", seqname, sequence);
+        fprintf(out_fp, ">%s\n%s\n", seq->name.s, sequence);
         free(sequence);
     }
 
     kseq_destroy(seq);
     gzclose(fp);
     fclose(out_fp);
-    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_file);
+    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_fn);
+    free(output_fn);
 }
 
 // Add reverse comparison function 

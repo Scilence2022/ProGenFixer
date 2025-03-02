@@ -2,3 +2,4 @@
 kcov
 ProGenFixer
 *.c.bak
+*.bak
