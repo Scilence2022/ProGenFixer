@@ -598,7 +598,7 @@ int kms_avg_cov(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
 int seq_kmers(uint64_t *kms, int k, int len, const char *seq) // insert k-mers in $seq to $kms
 {
     int i, l, km_num=0;
-    uint64_t x[2], mask = (1ULL<<k*2) - 1, shift = (k - 1) * 2;
+    uint64_t x[2], mask = (1ULL<<k*2) - 1;
     for (i = l = 0, x[0] = x[1] = 0; i < len; ++i) {
         int c = seq_nt4_table[(uint8_t)seq[i]];
         if (c < 4) { // not an "N" base
@@ -806,16 +806,16 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
 
 
 
-int kms_to_seq(unsigned char *aseq, uint64_t *kms, int ss, int tt){
+unsigned char* kms_to_seq(unsigned char *aseq, uint64_t *kms, int start, int term){
     
-    int i=0, l = tt-ss+1;
+    int i=0, l = term-start+1;
     //CALLOC(aseq, l);
     // fprintf(stdout, "ss: %d\t", ss);
     // fprintf(stdout, "tt: %d\n", tt);
 
     while(i<l){
         //print_uint64_kmer(kms[ss + i], 21);
-        int n = kms[ss + i] % 4;
+        int n = kms[start + i] % 4;
         *(aseq + i)  = nt4_seq_table[n];
         // fprintf(stdout, "nt4 seq table: %d\n", (int) kms[i] & 3ULL);
         //fprintf(stdout, "%d\t", n);
@@ -1010,6 +1010,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             strcpy(var->type, "SUB");
         }
     }
+    return 0;
 }
 
 // Greedy path search function
@@ -1478,7 +1479,7 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
     // Cleaning 
     kseq_destroy(pl.ks);
     // gzclose(fp);
-    // fprintf(stdout, "I am here, working .... \n");  
+   
     
     return eva;
 }
@@ -1496,8 +1497,7 @@ static kc_c4x_t *index_ref(const char *fn, int k, int p)
     pl.ks = kseq_init(fp);
     pl.k = k;
 
-    //fprintf(stderr, "Analyzing the locations with variations ...... \n"); 
-    //fprintf(stderr, "Analyzing the locations with variations ...... \n"); 
+ 
     uint64_t mask = (1ULL<<k*2) - 1;
     
     int ret;
@@ -1527,7 +1527,7 @@ static kc_c4x_t *index_ref(const char *fn, int k, int p)
                     int absent;
                     uint64_t y = hash64(x[0], mask);
                     int pre = y & ((1<<p) - 1);
-                    hh = &h[pre]; 
+                    hh = (kc_c4_t*)&h[pre]; 
                     k = kc_c4_put(hh, x[0]>>p<<KC_BITS, &absent);
                     if ((kh_key(hh, k)&KC_MAX) < KC_MAX) kh_key(hh, k) = kh_key(hh, k) + i + 1;
                 }
