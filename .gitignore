@@ -3,3 +3,4 @@ kcov
 ProGenFixer
 *.c.bak
 *.bak
+*.pdf
