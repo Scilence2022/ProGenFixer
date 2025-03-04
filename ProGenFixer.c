@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <time.h> 
 #include <math.h>
+#include <unistd.h>
 
 #include "ketopt.h" // command-line argument parser
 #include "kthread.h" // multi-threading models: pipeline and multi-threaded for loop
@@ -1677,13 +1678,30 @@ int main(int argc, char *argv[])
     }
 
     fprintf(stderr, "k-mer size: %d\n", k);
-    fprintf(stderr, "Counting k-mers of NGS file 1  ......\n");
+    
+    // Calculate the number of files
+    int f_num = argc - o.ind;
+    
+    // Check if reference file exists
+    if (access(argv[o.ind], F_OK) != 0) {
+        fprintf(stderr, "Error: Reference file '%s' does not exist or is not accessible\n", argv[o.ind]);
+        return 1;
+    }
 
+    // Check if all NGS files exist before starting
+    for (int i = 1; i < f_num; i++) {
+        if (access(argv[o.ind + i], F_OK) != 0) {
+            fprintf(stderr, "Error: NGS file '%s' does not exist or is not accessible\n", argv[o.ind + i]);
+            return 1;
+        }
+    }
+    
+    fprintf(stderr, "Counting k-mers of NGS file 1  ......\n");
+    
     kc_c4x_t *h, *hr, *hr_pos;
     h = count_file(argv[o.ind + 1], k, p, block_size, n_thread);
     
-
-    int f_num = argc - o.ind, c_f_n = 2;
+    int c_f_n = 2;
     while(c_f_n < f_num ) {
         fprintf(stderr, "Counting NGS file %d ......\n", c_f_n );
         h = count_file2(argv[o.ind + c_f_n ], h, k, p, block_size, n_thread);  
