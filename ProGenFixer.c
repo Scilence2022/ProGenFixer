@@ -1824,9 +1824,9 @@ void usage(int k, int n_thread, int min_cov, int insert_size, float error_rate) 
         fprintf(stderr, "  -o STR     base name for output files [required]\n");
         fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
         fprintf(stderr, "\nSample commands:\n ");
-        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads.fq  > output.vcf\n ");
-        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads1.fq reads2.fq > output.vcf\n ");
-        fprintf(stderr, "\nProGenFixer ref_genome.fa reads1.fq reads2.fq reads3.fq > output.vcf\n ");
+        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads.fq  -o <output_prefix> --fix \n ");
+        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads1.fq reads2.fq -o <output_prefix>  --fix \n ");
+        fprintf(stderr, "\nProGenFixer ref_genome.fa reads1.fq reads2.fq reads3.fq -o <output_prefix>  --fix \n ");
     
         //fprintf(stderr, "  -e INT     percentages of sequencing error rate (for P-value calculation, default [%g])\n", error_rate);
         fprintf(stderr, "\n");
