@@ -681,7 +681,7 @@ static void worker_hist(void *data, long i, int tid) // callback for kt_for()
 		}
 }
 
-static void print_hist(const kc_c4x_t *h, int n_thread)
+static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 {
 	hist_aux_t a;
 	uint64_t cnt[256];
@@ -694,8 +694,24 @@ static void print_hist(const kc_c4x_t *h, int n_thread)
 		for (i = 0; i < 256; ++i)
 			cnt[i] += a.cnt[j].c[i];
 	free(a.cnt);
+	
+	// Create output filename using the output_base
+	char histo_fn[256];
+	snprintf(histo_fn, sizeof(histo_fn), "%s.histo", output_base);
+	
+	// Open the output file
+	FILE *fp = fopen(histo_fn, "w");
+	if (!fp) {
+		fprintf(stderr, "Error: Could not open histogram file %s\n", histo_fn);
+		return;
+	}
+	
+	// Write histogram data to file
 	for (i = 1; i < 256; ++i)
-		printf("%d\t%ld\n", i, (long)cnt[i]);
+		fprintf(fp, "%d\t%ld\n", i, (long)cnt[i]);
+	
+	fclose(fp);
+	fprintf(stderr, "K-mer histogram written to %s\n", histo_fn);
 }
 
 
@@ -1754,8 +1770,8 @@ int main(int argc, char *argv[])
         c_f_n = c_f_n + 1;
     }
 
-
-    print_hist(h, n_thread);
+    // Update the print_hist call to include the output_base parameter
+    print_hist(h, n_thread, output_base);
 
     //fprintf(stderr, "Analyzing k-mers of reference sequence ......\n");
     //hr = count_file(argv[o.ind + 1], k, p, block_size, n_thread);
