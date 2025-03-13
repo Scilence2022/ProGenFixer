@@ -1875,33 +1875,30 @@ int main(int argc, char *argv[])
 }
 
 void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate) {
-
-        //fprintf(stderr, "\n=======================================================================================================\n");
-        fprintf(stderr, "                                                                                               \n");
-        fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer for haploid genomes \n");
-        fprintf(stderr, "Version 20240412  Author: Lifu Song songlf@tib.cas.cn\n");
-        fprintf(stderr, "                                                                                 ");
-        //fprintf(stderr, "\n=======================================================================================================\n\n");
-        fprintf(stderr, "\n\n");
-        fprintf(stderr, "Usage: \n\nProGenFixer [options] Reference NGS_files > output.tab \n");
-        fprintf(stderr, "                       [Supporting formats: *fq, *fa, *fq.gz, *fa.gz]\n");
-        fprintf(stderr, "Options:\n");
-        fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
-        fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
-        fprintf(stderr, "  -a INT     minimal k-mer coverage for assembly [%d]\n", assem_min_cov);
-        fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
-        fprintf(stderr, "  -t INT     number of threads for k-mer counting (default [%d])\n", n_thread);
-        fprintf(stderr, "  --fix [FILE]  Correct reference genome using detected variants (default: fixed_reference.fna)\n");
-        fprintf(stderr, "  -o STR     base name for output files [required]\n");
-        fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
-        fprintf(stderr, "\nSample commands:\n ");
-        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads.fq  -o <output_prefix> --fix \n ");
-        fprintf(stderr, "\nProGenFixer  ref_genome.fa reads1.fq reads2.fq -o <output_prefix>  --fix \n ");
-        fprintf(stderr, "\nProGenFixer ref_genome.fa reads1.fq reads2.fq reads3.fq -o <output_prefix>  --fix \n ");
-    
-        //fprintf(stderr, "  -e INT     percentages of sequencing error rate (for P-value calculation, default [%g])\n", error_rate);
-        fprintf(stderr, "\n");
-        return;
+    fprintf(stderr, "\n");
+    fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer for haploid genomes\n");
+    fprintf(stderr, "Version 20240412  Author: Lifu Song songlf@tib.cas.cn\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Usage: ProGenFixer [options] Reference NGS_files -o output_prefix\n");
+    fprintf(stderr, "       [Supporting formats: fq, fa, fq.gz, fa.gz]\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
+    fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
+    fprintf(stderr, "  -a INT     minimal k-mer coverage for assembly [%d]\n", assem_min_cov);
+    fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
+    fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
+    fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
+    fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
+    fprintf(stderr, "  -o STR     base name for output files [required]\n");
+    fprintf(stderr, "  --fix      enable reference correction (outputs fixed_reference.fna by default)\n");
+    fprintf(stderr, "  --fix FILE specify output filename for corrected reference\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -a 5 --fix\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -n 3 --fix\n");
+    fprintf(stderr, "\n");
 }
 
 
