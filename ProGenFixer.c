@@ -1891,8 +1891,7 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
     fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
-    fprintf(stderr, "  --fix      enable reference correction (outputs fixed_reference.fna by default)\n");
-    fprintf(stderr, "  --fix FILE specify output filename for corrected reference\n");
+    fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
