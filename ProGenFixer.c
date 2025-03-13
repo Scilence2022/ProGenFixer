@@ -1073,7 +1073,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
 }
 
 // Greedy path search function
-int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min_cov){ 
+int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int assem_min_cov){ 
     debug_print("##### var_path_search_ref() \n");
     
     // Validate input parameters
@@ -1106,8 +1106,8 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
     all_nodes[0].pre_node = NULL; // Ensure pre_node is initialized
     
     int a_cov = 1;
-    if (a_cov < min_cov) {
-        a_cov = min_cov;
+    if (a_cov < assem_min_cov) {
+        a_cov = assem_min_cov;
     }
     
     term_nodes[0] = &all_nodes[0];
@@ -1197,7 +1197,7 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
 }
 
 // Assembly-based variation analysis of sepecific location. The greedy path searching is performed by var_path_search_ref() function.
-int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min_cov){ 
+int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min_cov, int assem_min_cov){ 
     debug_print("##### var_analysis_ref() \n");
     // debuging scripts
     uint64_t mask = (1ULL<<eva->k*2) - 1;
@@ -1232,25 +1232,26 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
         return 0;
     }
     
-    int good_term_node_num = var_path_search_ref(eva, var_loc_p, max_path_len, min_cov);
+    int good_term_node_num = var_path_search_ref(eva, var_loc_p, max_path_len, assem_min_cov);
     
     int ext_times = 0;
     while (good_term_node_num < 1 && ext_times < 5 && eva->var_locs[var_loc_p].pos_s > eva->k) {
         // Add safety check before extending
         if (eva->var_locs[var_loc_p].pos_s <= 0 || eva->var_locs[var_loc_p].pos_t <= 0) {
-            fprintf(stderr, "Error: Invalid positions before extent_var_loc\n");
+            fprintf(stderr, "Error: Invalid positions before extent_ var_loc\n");
             break;
         }
         
-        extent_var_loc(eva, eva->kms, &eva->var_locs[var_loc_p], min_cov, eva->k);
+        // Use min_cov for extending variation locations
+        extent_var_loc(eva, eva->kms, &eva->var_locs[var_loc_p], assem_min_cov, eva->k);
         
         // Verify positions after extension
         if (eva->var_locs[var_loc_p].pos_s < 0 || eva->var_locs[var_loc_p].pos_t < 0) {
-            fprintf(stderr, "Error: Invalid positions after extent_var_loc\n");
+            fprintf(stderr, "Error: Invalid positions after extent_ var_loc\n");
             break;
         }
         
-        good_term_node_num = var_path_search_ref(eva, var_loc_p, max_path_len, min_cov);
+        good_term_node_num = var_path_search_ref(eva, var_loc_p, max_path_len, assem_min_cov);
         ext_times = ext_times + 1;
     }
     
@@ -1301,10 +1302,10 @@ int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num){
     return best_path;
 }
 
-int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int min_cov, int dis){ 
+int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis){ 
     // Validate input parameters
     if (!eva || !kms || !var_loc) {
-        fprintf(stderr, "Error: Invalid parameters in extent_var_loc\n");
+        fprintf(stderr, "Error: Invalid parameters\n");
         return 0;
     }
     
@@ -1313,7 +1314,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     
     // Validate positions before extending
     if (var_loc->pos_s < 0 || var_loc->pos_t < 0) {
-        fprintf(stderr, "Error: Invalid positions in extent_var_loc: %d-%d\n", 
+        fprintf(stderr, "Error: Invalid positions: %d-%d\n", 
                 var_loc->pos_s, var_loc->pos_t);
         return 0;
     }
@@ -1335,7 +1336,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     int cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
     
     int itt = 0;
-    while (cov_s <= min_cov && itt < dis && var_loc->pos_s > k) {
+    while (cov_s <= assem_min_cov && itt < dis && var_loc->pos_s > k) {
         var_loc->pos_s = var_loc->pos_s - 1;
         if (var_loc->pos_s < 0) {
             var_loc->pos_s = 0;
@@ -1348,7 +1349,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     itt = 0;
     // We need to limit how far we can extend to avoid going out of bounds
     int max_extension = 1000; // Arbitrary limit
-    while (cov_t <= min_cov && itt < dis && itt < max_extension) {
+    while (cov_t <= assem_min_cov && itt < dis && itt < max_extension) {
         var_loc->pos_t = var_loc->pos_t + 1;
         cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
         itt = itt + 1;
@@ -1365,7 +1366,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     static int recursion_depth = 0;
     if ((cov_rr > 1 || cov_tt > 1) && recursion_depth < 5) {
         recursion_depth++;
-        extent_var_loc(eva, kms, var_loc, min_cov, dis);
+        extent_var_loc(eva, kms, var_loc, assem_min_cov, dis);
         recursion_depth--;
     }
     
@@ -1373,7 +1374,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
 } 
 
 
-int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int min_cov){ 
+int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov){ 
     //fprintf(stdout, "#############optimize_var_loc() function \n");
     int k = eva->k;
     //int p = eva->p;
@@ -1387,9 +1388,9 @@ int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, in
     // fprintf(stdout, "Cov_t: %d \n", cov_t);
 
     int shift_time = 0;
-    while(cov_s > min_cov && cov_t/cov_s > 2.8 || rep_km_num > 2 && shift_time <= k){
+    while(cov_s > assem_min_cov && cov_t/cov_s > 2.8 || rep_km_num > 2 && shift_time <= k){
         cov_s = kmer_cov(min_hash_key(kms[var_loc->pos_s - 1],k), mask, eva->h);
-        if(cov_s >= min_cov && cov_s > 0){
+        if(cov_s >= assem_min_cov && cov_s > 0){
             var_loc->pos_s = var_loc->pos_s -1;
             var_loc->kmer_s = kms[var_loc->pos_s];
             
@@ -1406,7 +1407,7 @@ int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, in
 } 
 
 // Search for locations with variations
-static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max_len, int min_cov)
+static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max_len, int min_cov, int assem_min_cov)
 {
     pldat_t pl;
     gzFile fp;
@@ -1491,11 +1492,14 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         
         fprintf(stderr, "Found %d variation locations in sequence: %s\n", var_loc_num, pl.ks->name.s);
         
+
+
         // Process variations for this sequence
         fprintf(stderr, "Analyzing the variation details for sequence: %s\n", pl.ks->name.s);
         int var_loc_p = 0;
         while(var_loc_p < var_loc_num) { 
-            var_analysis_ref(eva, var_loc_p, max_len, min_cov); 
+            // Pass both min_cov and assem_min_cov
+            var_analysis_ref(eva, var_loc_p, max_len, min_cov, assem_min_cov); 
             var_loc_p++;
         }
         
@@ -1692,7 +1696,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
 {
-    int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, insert_size = 1000;
+    int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, assem_min_cov = 4, insert_size = 1000;
     float error_rate = 0.025f;
     int num_iters = 2;  // Default number of iterations
     char *output_base = NULL;
@@ -1705,11 +1709,12 @@ int main(int argc, char *argv[])
     };
     char *fix_output = "fixed_reference.fna";  // Default output name
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:l:e:o:n:", long_options)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:", long_options)) >= 0) {
         if (c == 'k') k = atoi(o.arg);
         //else if (c == 'p') p = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
+        else if (c == 'a') assem_min_cov = atoi(o.arg);  // New option for assembly min coverage
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
         else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
@@ -1730,7 +1735,7 @@ int main(int argc, char *argv[])
     }
 
     if (argc - o.ind < 2) {
-        usage(k, n_thread, min_cov, insert_size, error_rate);
+        usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate);
         return 1;
     }
 
@@ -1832,7 +1837,7 @@ int main(int argc, char *argv[])
 
         // Run analysis
         fprintf(stderr, "Running analysis for iteration %d...\n", iter);
-        analysis_ref_seq(&eva, current_ref, insert_size, min_cov);
+        analysis_ref_seq(&eva, current_ref, insert_size, min_cov, assem_min_cov);
         fclose(vcf_fp);
 
         // Apply corrections if we found any variations
@@ -1869,7 +1874,7 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-void usage(int k, int n_thread, int min_cov, int insert_size, float error_rate) {
+void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate) {
 
         //fprintf(stderr, "\n=======================================================================================================\n");
         fprintf(stderr, "                                                                                               \n");
@@ -1883,6 +1888,7 @@ void usage(int k, int n_thread, int min_cov, int insert_size, float error_rate) 
         fprintf(stderr, "Options:\n");
         fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
         fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
+        fprintf(stderr, "  -a INT     minimal k-mer coverage for assembly [%d]\n", assem_min_cov);
         fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
         fprintf(stderr, "  -t INT     number of threads for k-mer counting (default [%d])\n", n_thread);
         fprintf(stderr, "  --fix [FILE]  Correct reference genome using detected variants (default: fixed_reference.fna)\n");
