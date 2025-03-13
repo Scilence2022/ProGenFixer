@@ -647,6 +647,7 @@ typedef struct { // data structure for file evaluation
     var_location *var_locs;
     FILE *vcf_out;
     int iteration;
+    char *output_base;  // Add this field to store the output base name
 } evaluation_t;
 
 typedef struct path_node {
@@ -1278,6 +1279,35 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
             fprintf(stdout, "\tMultiple-path");
         }
         fprintf(stdout, "\n");
+    }else{
+        // Output the location failed assembly to a separate file
+        static FILE *low_quality_fp = NULL;
+        static char low_quality_fn[256] = {0};
+        
+        // Open the low quality zones file if it's not already open
+        if (low_quality_fp == NULL && eva->output_base != NULL) {
+            snprintf(low_quality_fn, sizeof(low_quality_fn), "%s.low_quality_zones", eva->output_base);
+            low_quality_fp = fopen(low_quality_fn, "w");
+            if (!low_quality_fp) {
+                fprintf(stderr, "Error: Could not open low quality zones file %s\n", low_quality_fn);
+                return 0;
+            }
+            // Write header
+            fprintf(low_quality_fp, "#CHROM\tSTART\tEND\tLENGTH\tITERATION\n");
+        }
+        
+        if (low_quality_fp) {
+            // Write location information to the file
+            fprintf(low_quality_fp, "%s\t%d\t%d\t%d\t%d\n", 
+                    eva->var_locs[var_loc_p].name,
+                    eva->var_locs[var_loc_p].pos_s + eva->k + 1,  // Convert to 1-based genomic position
+                    eva->var_locs[var_loc_p].pos_t + eva->k,      // End position
+                    eva->var_locs[var_loc_p].pos_t - eva->var_locs[var_loc_p].pos_s,  // Length
+                    eva->iteration);  // Current iteration
+            
+            // Flush the file to ensure data is written
+            fflush(low_quality_fp);
+        }
     }
 
     return good_term_node_num;
@@ -1786,15 +1816,16 @@ int main(int argc, char *argv[])
 
     evaluation_t eva;
     eva.h = h;
-    eva.hr =hr;
-    eva.hr_pos =hr_pos;
-    eva.k=k;
-    eva.p=p;
+    eva.hr = hr;
+    eva.hr_pos = hr_pos;
+    eva.k = k;
+    eva.p = p;
     eva.error_rate = error_rate;
     eva.fix_enabled = fix_enabled;
     eva.var_count = 0;
     eva.var_capacity = 0;
     eva.variations = NULL;
+    eva.output_base = output_base;  // Set the output_base in the eva struct
 
     char *current_ref = argv[o.ind];
     for (int iter = 1; iter <= num_iters; iter++) {
