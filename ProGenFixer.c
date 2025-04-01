@@ -1624,11 +1624,11 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                 }
 
                 // Debug output before applying variation
-                fprintf(stderr, "Applying variation at position %d:\n", var->pos);
-                fprintf(stderr, "  Type: %s\n", var->type);
-                fprintf(stderr, "  REF: '%s'\n", var->ref);
-                fprintf(stderr, "  ALT: '%s'\n", var->alt);
-                fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
+                // fprintf(stderr, "Applying variation at position %d:\n", var->pos);
+                // fprintf(stderr, "  Type: %s\n", var->type);
+                // fprintf(stderr, "  REF: '%s'\n", var->ref);
+                // fprintf(stderr, "  ALT: '%s'\n", var->alt);
+                // fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
 
                 if (strcmp(var->type, "SUB") == 0) {
                     int ref_len = strlen(var->ref);
