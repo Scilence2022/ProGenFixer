@@ -1275,10 +1275,10 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
         
         output_path(eva, var_loc_p, best_termnode_index);
         
-        if (good_term_node_num > 1) {
-            fprintf(stdout, "\tMultiple-path");
-        }
-        fprintf(stdout, "\n");
+        // if (good_term_node_num > 1) {
+        //     fprintf(stdout, "\tMultiple-path");
+        // }
+        // fprintf(stdout, "\n");
     }else{
         // Output the location failed assembly to a separate file
         static FILE *low_quality_fp = NULL;
@@ -1613,11 +1613,11 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                 }
 
                 // Debug output before applying variation
-                fprintf(stderr, "Applying variation at position %d:\n", var->pos);
-                fprintf(stderr, "  Type: %s\n", var->type);
-                fprintf(stderr, "  REF: '%s'\n", var->ref);
-                fprintf(stderr, "  ALT: '%s'\n", var->alt);
-                fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
+                // fprintf(stderr, "Applying variation at position %d:\n", var->pos);
+                // fprintf(stderr, "  Type: %s\n", var->type);
+                // fprintf(stderr, "  REF: '%s'\n", var->ref);
+                // fprintf(stderr, "  ALT: '%s'\n", var->alt);
+                // fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
 
                 if (strcmp(var->type, "SUB") == 0) {
                     int ref_len = strlen(var->ref);
@@ -1634,7 +1634,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     }
                     // Replace REF with ALT
                     memcpy(&sequence[pos], var->alt, alt_len);
-                    fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
                 } else if (strcmp(var->type, "INS") == 0) {
                     // Insert ALT after POS (VCF format)
                     int ref_len = strlen(var->ref);
@@ -1676,7 +1676,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     sequence = new_seq;
                     len += ins_len;
                     
-                    fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
                 } else if (strcmp(var->type, "DEL") == 0) {
                     int ref_len = strlen(var->ref);
                     int alt_len = strlen(var->alt);
@@ -1699,7 +1699,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     memmove(&sequence[pos + alt_len], &sequence[pos + ref_len], len - pos - ref_len + 1); // +1 for null terminator
                     len -= del_len;
                     
-                    fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
                 }
             }
             
