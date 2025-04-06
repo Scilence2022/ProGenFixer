@@ -648,6 +648,7 @@ typedef struct { // data structure for file evaluation
     FILE *vcf_out;
     int iteration;
     char *output_base;  // Add this field to store the output base name
+    int output_best_path;  // Add this field for -m option
 } evaluation_t;
 
 typedef struct path_node {
@@ -1276,8 +1277,18 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
         output_path(eva, var_loc_p, best_termnode_index);
         
         if (good_term_node_num > 1) {
+            
+            if (eva->output_best_path) {
+                output_path(eva, var_loc_p, best_termnode_index);
+            } 
             fprintf(stdout, "\tMultiple-path");
+            // Only output best path if -m option is specified
+        }else{
+            output_path(eva, var_loc_p, best_termnode_index);
         }
+        
+       
+        
         fprintf(stdout, "\n");
     }else{
         // Output the location failed assembly to a separate file
@@ -1730,6 +1741,7 @@ int main(int argc, char *argv[])
     float error_rate = 0.025f;
     int num_iters = 2;  // Default number of iterations
     char *output_base = NULL;
+    int output_best_path = 0;  // New flag for -m option
 
     ketopt_t o = KETOPT_INIT;
     int fix_enabled = 0;
@@ -1739,7 +1751,7 @@ int main(int argc, char *argv[])
     };
     char *fix_output = "fixed_reference.fna";  // Default output name
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:", long_options)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:m", long_options)) >= 0) {
         if (c == 'k') k = atoi(o.arg);
         //else if (c == 'p') p = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
@@ -1748,6 +1760,7 @@ int main(int argc, char *argv[])
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
         else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
+        else if (c == 'm') output_best_path = 1;  // New option for outputting best path
         else if (c == 128) {  // Handle --fix
             fix_enabled = 1;
             if (o.arg) {
@@ -1826,6 +1839,7 @@ int main(int argc, char *argv[])
     eva.var_capacity = 0;
     eva.variations = NULL;
     eva.output_base = output_base;  // Set the output_base in the eva struct
+    eva.output_best_path = output_best_path;  // Set the output_best_path flag
 
     char *current_ref = argv[o.ind];
     for (int iter = 1; iter <= num_iters; iter++) {
@@ -1922,12 +1936,13 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
     fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
+    fprintf(stderr, "  -m         output the best path for each variation\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -a 5 --fix\n");
-    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -n 3 --fix\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -n 3 -m --fix\n");
     fprintf(stderr, "\n");
 }
 
