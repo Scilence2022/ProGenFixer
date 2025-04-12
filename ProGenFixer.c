@@ -15,7 +15,7 @@
 KSEQ_INIT(gzFile, gzread)
 
 #include "khashl.h" // hash table
-#define KC_BITS 10
+#define KC_BITS 12
 #define KC_MAX ((1<<KC_BITS) - 1)
 #define kc_c4_eq(a, b) ((a)>>KC_BITS == (b)>>KC_BITS) // lower 10 bits for counts; higher bits for k-mer
 #define kc_c4_hash(a) ((a)>>KC_BITS)
