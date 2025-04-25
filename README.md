@@ -49,8 +49,9 @@ Where:
 ### Options
 
 - `-k INT` : k-mer size (default: 31)
-- `-c INT` : minimal k-mer coverage for variant calling (default: 3)
-- `-l INT` : maximal assembly length (default: 1000)
+- `-c INT` : minimal k-mer coverage for detection of variation regions (default: 2)
+- `-a INT` : minimal k-mer coverage for variant calling (default: 5)
+- `-l INT` : maximal assembly length for variant calling (default: 1000)
 - `-t INT` : number of threads for k-mer counting (default: 3)
 - `-o STR` : base name for output files (required)
 - `-n INT` : number of correction iterations (default: 2)
@@ -133,7 +134,7 @@ This approach is particularly effective for prokaryotic genomes, which are typic
 
 If you use ProGenFixer in your research, please cite:
 
-Song, L. (2025). ProGenFixer: A k-mer based tool for detecting and correcting variants in prokaryotic genomes.
+Song et al. (2025). ProGenFixer: an ultra-fast and accurate tool for correcting prokaryotic genome sequences using a mapping-free algorithm
 
 ## License
 
