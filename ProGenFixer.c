@@ -1691,7 +1691,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
 {
-    int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, assem_min_cov = 4, insert_size = 1000;
+    int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 2, assem_min_cov = 5, insert_size = 1000;
     float error_rate = 0.025f;
     int num_iters = 2;  // Default number of iterations
     char *output_base = NULL;
@@ -1859,19 +1859,19 @@ int main(int argc, char *argv[])
 
 void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate) {
     fprintf(stderr, "\n");
-    fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer for haploid genomes\n");
-    fprintf(stderr, "Version 20240412  Author: Lifu Song songlf@tib.cas.cn\n");
+    fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer\n");
+    fprintf(stderr, "Version v1.0 (20250425)  Author: Lifu Song songlf@tib.cas.cn\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Usage: ProGenFixer [options] Reference NGS_files -o output_prefix\n");
     fprintf(stderr, "       [Supporting formats: fq, fa, fq.gz, fa.gz]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
-    fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
-    fprintf(stderr, "  -a INT     minimal k-mer coverage for assembly [%d]\n", assem_min_cov);
+    fprintf(stderr, "  -c INT     minimal k-mer coverage for identifying variation regions [%d]\n", min_cov);
+    fprintf(stderr, "  -a INT     minimal k-mer coverage for assemble-based variant calling [%d]\n", assem_min_cov);
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
-    fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
+    // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
     fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
