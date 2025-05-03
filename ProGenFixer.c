@@ -15,7 +15,7 @@
 KSEQ_INIT(gzFile, gzread)
 
 // Forward declaration to avoid implicit declaration warning for usage()
-void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate);
+void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov);
 #include "khashl.h" // hash table
 #define KC_BITS 12
 #define KC_MAX ((1<<KC_BITS) - 1)
@@ -622,6 +622,7 @@ typedef struct { // data structure for file evaluation
     variation_t *variations;
     int var_count;
     int var_capacity;
+    int max_assem_cov; // Added max assembly coverage
 
     uint64_t *kms;
     int k;
@@ -1089,6 +1090,7 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
     
     kc_c4x_t *h = eva->h;
     int k = eva->k;
+    int max_assem_cov = eva->max_assem_cov; // Get max coverage from eva struct
     uint64_t mask = (1ULL<<k*2) - 1;
     
     // Safely access var_locs
@@ -1165,7 +1167,8 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
             int i;
             for(i=0;i<4;i++){
                 // if(next_nodes[i].cov >=a_cov && next_nodes[i].cov <= b_cov){
-                if(next_nodes[i].cov >=a_cov){
+                // Check both min and max coverage limits (max limit only if > 0)
+                if(next_nodes[i].cov >=a_cov && (max_assem_cov <= 0 || next_nodes[i].cov <= max_assem_cov)){
                     //print_uint64_kmer(next_nodes[i].kmer, k);
                     //print_uint64_kmer(kmer_t, k);
                     if( next_nodes[i].kmer == kmer_t){ // if the k-mer is equal to kmer_t, then 
@@ -1729,6 +1732,7 @@ int main(int argc, char *argv[])
     int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 2, assem_min_cov = 5, insert_size = 1000;
     float error_rate = 0.025f;
     int num_iters = 2;  // Default number of iterations
+    int max_assem_cov = 0; // Default: no max coverage limit
     char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
@@ -1738,11 +1742,12 @@ int main(int argc, char *argv[])
         { 0, 0, 0 }
     };
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:", long_options)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:m:", long_options)) >= 0) { // Added 'm:'
         if (c == 'k') k = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
         else if (c == 'a') assem_min_cov = atoi(o.arg);  // New option for assembly min coverage
+        else if (c == 'm') max_assem_cov = atoi(o.arg); // Parse max assembly coverage
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
         else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
@@ -1753,7 +1758,7 @@ int main(int argc, char *argv[])
     }
 
     if (argc - o.ind < 2) {
-        usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate);
+        usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov); // Pass max_assem_cov
         return 1;
     }
 
@@ -1809,6 +1814,7 @@ int main(int argc, char *argv[])
     eva.p = p;
     eva.error_rate = error_rate;
     eva.fix_enabled = fix_enabled;
+    eva.max_assem_cov = max_assem_cov; // Set max coverage in eva struct
     eva.var_count = 0;
     eva.var_capacity = 0;
     eva.variations = NULL;
@@ -1892,7 +1898,7 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate) {
+void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov) { // Added max_assem_cov parameter
     fprintf(stderr, "\n");
     fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer\n");
     fprintf(stderr, "Version v1.0 (20250425)  Author: Lifu Song songlf@tib.cas.cn\n");
@@ -1904,6 +1910,7 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
     fprintf(stderr, "  -c INT     minimal k-mer coverage for identifying variation regions [%d]\n", min_cov);
     fprintf(stderr, "  -a INT     minimal k-mer coverage for assemble-based variant calling [%d]\n", assem_min_cov);
+    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov); // Added -m description
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
     // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
@@ -1914,7 +1921,7 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -a 5 --fix\n");
-    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -n 3 --fix\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -m 100 -n 3 --fix\n"); // Added example with -m
     fprintf(stderr, "\n");
 }
 
