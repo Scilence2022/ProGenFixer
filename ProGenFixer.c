@@ -647,7 +647,7 @@ typedef struct path_node {
 
 
 typedef struct {
-	uint64_t c[256];
+	uint64_t *c; // Changed from fixed array to pointer
 } buf_cnt_t;
 
 typedef struct {
@@ -658,30 +658,62 @@ typedef struct {
 static void worker_hist(void *data, long i, int tid) // callback for kt_for()
 {
 	hist_aux_t *a = (hist_aux_t*)data;
-	uint64_t *cnt = a->cnt[tid].c;
+	uint64_t *cnt = a->cnt[tid].c; // Access pointer
 	kc_c4_t *g = a->h->h[i];
 	khint_t k;
 	for (k = 0; k < kh_end(g); ++k)
 		if (kh_exist(g, k)) {
 			int c = kh_key(g, k) & KC_MAX;
-			++cnt[c < 255? c : 255];
+			// Use c directly as the index, capped by KC_MAX
+			if (c <= KC_MAX) { // Check added just in case, though c should always be <= KC_MAX
+				++cnt[c];
+			}
 		}
 }
 
 static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 {
 	hist_aux_t a;
-	uint64_t cnt[256];
+	uint64_t *cnt; // Changed from fixed array to pointer
 	int i, j;
+	size_t hist_size = (size_t)KC_MAX + 1; // Calculate histogram size based on KC_MAX
+
 	a.h = h;
-	CALLOC(a.cnt, n_thread);
+	CALLOC(a.cnt, n_thread); // Allocate array of structs
+
+	// Allocate count arrays within each struct
+	for (j = 0; j < n_thread; ++j) {
+		CALLOC(a.cnt[j].c, hist_size); // Allocate based on hist_size
+		if (a.cnt[j].c == NULL) {
+			fprintf(stderr, "Error: Memory allocation failed for histogram counts (thread %d)\n", j);
+			// Cleanup partially allocated memory
+			while (--j >= 0) free(a.cnt[j].c);
+			free(a.cnt);
+			return; // Exit if allocation fails
+		}
+	}
+
 	kt_for(n_thread, worker_hist, &a, 1<<h->p);
-	for (i = 0; i < 256; ++i) cnt[i] = 0;
-	for (j = 0; j < n_thread; ++j)
-		for (i = 0; i < 256; ++i)
+
+	// Allocate the final aggregated count array
+	CALLOC(cnt, hist_size);
+	if (cnt == NULL) {
+		fprintf(stderr, "Error: Memory allocation failed for aggregated histogram counts\n");
+		// Cleanup worker thread allocations
+		for (j = 0; j < n_thread; ++j) free(a.cnt[j].c);
+		free(a.cnt);
+		return; // Exit if allocation fails
+	}
+
+	// Aggregate counts from threads
+	for (j = 0; j < n_thread; ++j) {
+		for (i = 0; i < hist_size; ++i) { // Iterate up to hist_size
 			cnt[i] += a.cnt[j].c[i];
-	free(a.cnt);
-	
+		}
+		free(a.cnt[j].c); // Free individual thread count arrays after aggregation
+	}
+	free(a.cnt); // Free the array of structs
+
 	// Create output filename using the output_base
 	char histo_fn[256];
 	snprintf(histo_fn, sizeof(histo_fn), "%s.histo", output_base);
@@ -694,11 +726,14 @@ static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 	}
 	
 	// Write histogram data to file
-	for (i = 1; i < 256; ++i)
+	for (i = 1; i < hist_size; ++i) // Iterate up to hist_size
 		fprintf(fp, "%d\t%ld\n", i, (long)cnt[i]);
 	
 	fclose(fp);
 	fprintf(stderr, "K-mer histogram written to %s\n", histo_fn);
+
+	// Free the aggregated count array
+	free(cnt);
 }
 
 
