@@ -1013,15 +1013,21 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     // fprintf(stdout, "ref_seq_len: %d\n", ref_seq_len);
 
     fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
+    char info_field[200];
+    char var_type[4];
+
     if(slim_path_len >= ref_seq_len){
         kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
         kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k + 1); 
-        fprintf(eva->vcf_out, ".\t");
+        fprintf(eva->vcf_out, ".\t"); // ID
         fprintf(eva->vcf_out, "%s\t", ref_seq);
         fprintf(eva->vcf_out, "%s\t", path_seq);
-        fprintf(eva->vcf_out, "%d\t", path_cov);
-        if(slim_path_len > ref_seq_len){fprintf(eva->vcf_out, "INS\t"); }else{fprintf(eva->vcf_out, "SUB\t"); }
+        fprintf(eva->vcf_out, ".\t"); // QUAL
+        fprintf(eva->vcf_out, "PASS\t"); // FILTER
+        if(slim_path_len > ref_seq_len){strcpy(var_type, "INS"); }else{strcpy(var_type, "SUB"); }
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        fprintf(eva->vcf_out, "%s", info_field);
 
     }
     if(slim_path_len < ref_seq_len){ //Deletion
@@ -1036,12 +1042,15 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
         //kms_to_seq(ref_seq, eva->kms, ref_var.pos_s, ref_var.pos_t - k + 1 );
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k );
-        fprintf(eva->vcf_out, ".\t");
-        fprintf(eva->vcf_out, "%s\t", ref_seq);
-        fprintf(eva->vcf_out, "%s", path_seq); 
-        fprintf(eva->vcf_out, "\t%d\t", path_cov);
-        fprintf(eva->vcf_out, "DEL\t");
+        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k ); // POS for DEL is 1-based pos before deletion
+        fprintf(eva->vcf_out, ".\t"); // ID
+        fprintf(eva->vcf_out, "%s\t", ref_seq); // REF
+        fprintf(eva->vcf_out, "%s\t", path_seq); // ALT (should be the base before deletion if ALT is single base)
+        fprintf(eva->vcf_out, ".\t"); // QUAL
+        fprintf(eva->vcf_out, "PASS\t"); // FILTER
+        strcpy(var_type, "DEL");
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        fprintf(eva->vcf_out, "%s", info_field);
     }
     fprintf(eva->vcf_out, "\n");
     
@@ -1831,7 +1840,17 @@ int main(int argc, char *argv[])
             continue;
         }
         
-        fprintf(vcf_fp, "##fileformat=VCF\n#CHROM\tPOS\tID\tREF\tALT\tk-mer coverage\tType\tAdditional info\n");
+        fprintf(vcf_fp, "##fileformat=VCFv4.5\n");
+        fprintf(vcf_fp, "##ProGenFixerVersion=v1.0\n");
+        fprintf(vcf_fp, "##ProGenFixerCommand=");
+        for (int i = 0; i < argc; i++) {
+            fprintf(vcf_fp, "%s%s", argv[i], (i == argc - 1) ? "" : " ");
+        }
+        fprintf(vcf_fp, "\n");
+
+        fprintf(vcf_fp, "##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description=\"K-mer coverage of the variant path\">\n");
+        fprintf(vcf_fp, "##INFO=<ID=VARTYPE,Number=1,Type=String,Description=\"Variant type (INS, DEL, SUB)\">\n");
+        fprintf(vcf_fp, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
 
         // Count current reference k-mers
         fprintf(stderr, "Counting k-mers in reference for iteration %d...\n", iter);
