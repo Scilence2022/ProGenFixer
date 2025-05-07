@@ -14,8 +14,10 @@
 #include "kseq.h" // FASTA/Q parser
 KSEQ_INIT(gzFile, gzread)
 
+// Forward declaration to avoid implicit declaration warning for usage()
+void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov);
 #include "khashl.h" // hash table
-#define KC_BITS 10
+#define KC_BITS 12
 #define KC_MAX ((1<<KC_BITS) - 1)
 #define kc_c4_eq(a, b) ((a)>>KC_BITS == (b)>>KC_BITS) // lower 10 bits for counts; higher bits for k-mer
 #define kc_c4_hash(a) ((a)>>KC_BITS)
@@ -436,26 +438,6 @@ static kc_c4x_t *count_file2(const char *fn, kc_c4x_t *hh, int k, int p, int blo
     return pl.h;
 }
 
-static kc_c4x_t *count_seq(const char *fn, int k, int p, int block_size, int n_thread)
-{
-    pldat_t pl;
-    gzFile fp;
-    if ((fp = gzopen(fn, "r")) == 0) return 0;
-    pl.ks = kseq_init(fp);
-    pl.k = k;
-    pl.n_thread = n_thread;
-    pl.h = c4x_init(p);
-    pl.block_len = block_size;
-    kt_pipeline(3, worker_pipeline, &pl, 3);
-    kseq_destroy(pl.ks);
-    gzclose(fp);
-    return pl.h;
-}
-
-
-
-
-
 int kmer_cov(uint64_t kmer, uint64_t mask, kc_c4x_t *h){
 
     int j, x, cov=0, a_key;
@@ -640,6 +622,7 @@ typedef struct { // data structure for file evaluation
     variation_t *variations;
     int var_count;
     int var_capacity;
+    int max_assem_cov; // Added max assembly coverage
 
     uint64_t *kms;
     int k;
@@ -649,6 +632,10 @@ typedef struct { // data structure for file evaluation
     int iteration;
     char *output_base;  // Add this field to store the output base name
 } evaluation_t;
+
+// Forward declarations to avoid implicit declaration warnings for functions used before definition
+int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis);
+int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num);
 
 typedef struct path_node {
     struct path_node* pre_node;
@@ -661,7 +648,7 @@ typedef struct path_node {
 
 
 typedef struct {
-	uint64_t c[256];
+	uint64_t *c; // Changed from fixed array to pointer
 } buf_cnt_t;
 
 typedef struct {
@@ -672,30 +659,62 @@ typedef struct {
 static void worker_hist(void *data, long i, int tid) // callback for kt_for()
 {
 	hist_aux_t *a = (hist_aux_t*)data;
-	uint64_t *cnt = a->cnt[tid].c;
+	uint64_t *cnt = a->cnt[tid].c; // Access pointer
 	kc_c4_t *g = a->h->h[i];
 	khint_t k;
 	for (k = 0; k < kh_end(g); ++k)
 		if (kh_exist(g, k)) {
 			int c = kh_key(g, k) & KC_MAX;
-			++cnt[c < 255? c : 255];
+			// Use c directly as the index, capped by KC_MAX
+			if (c <= KC_MAX) { // Check added just in case, though c should always be <= KC_MAX
+				++cnt[c];
+			}
 		}
 }
 
 static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 {
 	hist_aux_t a;
-	uint64_t cnt[256];
+	uint64_t *cnt; // Changed from fixed array to pointer
 	int i, j;
+	size_t hist_size = (size_t)KC_MAX + 1; // Calculate histogram size based on KC_MAX
+
 	a.h = h;
-	CALLOC(a.cnt, n_thread);
+	CALLOC(a.cnt, n_thread); // Allocate array of structs
+
+	// Allocate count arrays within each struct
+	for (j = 0; j < n_thread; ++j) {
+		CALLOC(a.cnt[j].c, hist_size); // Allocate based on hist_size
+		if (a.cnt[j].c == NULL) {
+			fprintf(stderr, "Error: Memory allocation failed for histogram counts (thread %d)\n", j);
+			// Cleanup partially allocated memory
+			while (--j >= 0) free(a.cnt[j].c);
+			free(a.cnt);
+			return; // Exit if allocation fails
+		}
+	}
+
 	kt_for(n_thread, worker_hist, &a, 1<<h->p);
-	for (i = 0; i < 256; ++i) cnt[i] = 0;
-	for (j = 0; j < n_thread; ++j)
-		for (i = 0; i < 256; ++i)
+
+	// Allocate the final aggregated count array
+	CALLOC(cnt, hist_size);
+	if (cnt == NULL) {
+		fprintf(stderr, "Error: Memory allocation failed for aggregated histogram counts\n");
+		// Cleanup worker thread allocations
+		for (j = 0; j < n_thread; ++j) free(a.cnt[j].c);
+		free(a.cnt);
+		return; // Exit if allocation fails
+	}
+
+	// Aggregate counts from threads
+	for (j = 0; j < n_thread; ++j) {
+		for (i = 0; i < hist_size; ++i) { // Iterate up to hist_size
 			cnt[i] += a.cnt[j].c[i];
-	free(a.cnt);
-	
+		}
+		free(a.cnt[j].c); // Free individual thread count arrays after aggregation
+	}
+	free(a.cnt); // Free the array of structs
+
 	// Create output filename using the output_base
 	char histo_fn[256];
 	snprintf(histo_fn, sizeof(histo_fn), "%s.histo", output_base);
@@ -708,11 +727,14 @@ static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 	}
 	
 	// Write histogram data to file
-	for (i = 1; i < 256; ++i)
+	for (i = 1; i < hist_size; ++i) // Iterate up to hist_size
 		fprintf(fp, "%d\t%ld\n", i, (long)cnt[i]);
 	
 	fclose(fp);
 	fprintf(stderr, "K-mer histogram written to %s\n", histo_fn);
+
+	// Free the aggregated count array
+	free(cnt);
 }
 
 
@@ -741,7 +763,7 @@ int path_node_num(path_node *term_node){
 }
 
 
-unsigned char* nodes_path(path_node *term_node, unsigned char *path_seq, int k){
+int nodes_path(path_node *term_node, unsigned char *path_seq, int k){
     path_node *p_node = term_node;
     int path_len = path_node_num(p_node);
 
@@ -803,11 +825,9 @@ int nodes_path_cov( evaluation_t *eva, path_node *term_node){
     kc_c4x_t *h = eva->h;
     path_node *p_node = term_node;
     int k = eva->k;
-    float error_rate = eva->error_rate;
     uint64_t mask = (1ULL<<k*2) - 1; //
 
 
-    int path_len = path_node_num(p_node);
     int path_cov = kmer_cov(min_hash_key(p_node->kmer, k),mask,h);
     int passed_nodes = 0, p_node_cov = 0;   
 
@@ -831,9 +851,6 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
     int k = eva->k;
     float error_rate = eva->error_rate;
     uint64_t mask = (1ULL<<k*2) - 1; //
-
-    //fprintf(stderr, "dfasdfasdf\t");
-
     int path_len = path_node_num(p_node);
     int path_cov = kmer_cov(min_hash_key(p_node->kmer, k),mask,h);
     int passed_nodes = 0, p_node_cov = 0;   
@@ -850,14 +867,6 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
     }
 
     float p_kmer = pow(1-error_rate,2*k) * pow(error_rate/3.0, path_len-k-1);
-    float x, y;
-    // x = pow(1-error_rate,2*k);
-    // y = pow(error_rate/3.0, path_len-k-1);
-
-    // fprintf(stdout, "\tx:%f\t", x);
-    // fprintf(stdout, "\ty:%f\t", y);
-    // fprintf(stdout, "\tcov:%d\t", path_cov);
-
     float p_value = pow(p_kmer,path_cov);
     //fprint(stderr, "dfasdfasdf\n");
     return p_value;
@@ -942,10 +951,7 @@ int slim_path(evaluation_t *eva, var_location *a_var, var_location *new_var, uin
 // 
 int output_path(evaluation_t *eva, int var_loc_p, int path_index){ 
     // fprintf(stdout, "\n\n\n##### output_path() \n");
-    kc_c4x_t *h = eva->h;
     int k = eva->k;
-    uint64_t mask = (1ULL<<k*2) - 1; 
-
     //Sliming path
     var_location ref_var;
     ref_var.pos_s = eva->var_locs[var_loc_p].pos_s;
@@ -964,12 +970,11 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     var_location seq_var;
     //paded = if pad happend or not. 
     // fprintf(stdout, "before slim, path node num: %d\n", path_nodes_num);
-    int paded = slim_path(eva, &ref_var, &seq_var, path_kms, path_nodes_num);
+    slim_path(eva, &ref_var, &seq_var, path_kms, path_nodes_num);
 
     // fprintf(stdout, "##### slim_path function finished\n");
 
-    int start_pos = ref_var.pos_s; 
-    int term_pos = ref_var.pos_t; 
+    // Removed unused variables start_pos and term_pos
 
     // fprintf(stdout, "##### ref kmers\n");
     // print_uint64_kmer(eva->var_locs[var_loc_p].kmer_s, k); 
@@ -1008,15 +1013,21 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     // fprintf(stdout, "ref_seq_len: %d\n", ref_seq_len);
 
     fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
+    char info_field[200];
+    char var_type[4];
+
     if(slim_path_len >= ref_seq_len){
         kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
         kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k + 1); 
-        fprintf(eva->vcf_out, ".\t");
+        fprintf(eva->vcf_out, ".\t"); // ID
         fprintf(eva->vcf_out, "%s\t", ref_seq);
         fprintf(eva->vcf_out, "%s\t", path_seq);
-        fprintf(eva->vcf_out, "%d\t", path_cov);
-        if(slim_path_len > ref_seq_len){fprintf(eva->vcf_out, "INS\t"); }else{fprintf(eva->vcf_out, "SUB\t"); }
+        fprintf(eva->vcf_out, ".\t"); // QUAL
+        fprintf(eva->vcf_out, "PASS\t"); // FILTER
+        if(slim_path_len > ref_seq_len){strcpy(var_type, "INS"); }else{strcpy(var_type, "SUB"); }
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        fprintf(eva->vcf_out, "%s", info_field);
 
     }
     if(slim_path_len < ref_seq_len){ //Deletion
@@ -1031,12 +1042,15 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
         //kms_to_seq(ref_seq, eva->kms, ref_var.pos_s, ref_var.pos_t - k + 1 );
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k );
-        fprintf(eva->vcf_out, ".\t");
-        fprintf(eva->vcf_out, "%s\t", ref_seq);
-        fprintf(eva->vcf_out, "%s", path_seq); 
-        fprintf(eva->vcf_out, "\t%d\t", path_cov);
-        fprintf(eva->vcf_out, "DEL\t");
+        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k ); // POS for DEL is 1-based pos before deletion
+        fprintf(eva->vcf_out, ".\t"); // ID
+        fprintf(eva->vcf_out, "%s\t", ref_seq); // REF
+        fprintf(eva->vcf_out, "%s\t", path_seq); // ALT (should be the base before deletion if ALT is single base)
+        fprintf(eva->vcf_out, ".\t"); // QUAL
+        fprintf(eva->vcf_out, "PASS\t"); // FILTER
+        strcpy(var_type, "DEL");
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        fprintf(eva->vcf_out, "%s", info_field);
     }
     fprintf(eva->vcf_out, "\n");
     
@@ -1057,9 +1071,9 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
         // Calculate genomic position based on k-mer start and k size
         var->pos = ref_var.pos_s + eva->k + 1; // 1-based end position of k-mer
         
-        strncpy(var->ref, ref_seq, sizeof(var->ref));
+        strncpy(var->ref, (const char*)ref_seq, sizeof(var->ref));
         var->ref[sizeof(var->ref)-1] = '\0';
-        strncpy(var->alt, path_seq, sizeof(var->alt));
+        strncpy(var->alt, (const char*)path_seq, sizeof(var->alt));
         var->alt[sizeof(var->alt)-1] = '\0';
         
         if(slim_path_len > ref_seq_len) {
@@ -1085,6 +1099,7 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
     
     kc_c4x_t *h = eva->h;
     int k = eva->k;
+    int max_assem_cov = eva->max_assem_cov; // Get max coverage from eva struct
     uint64_t mask = (1ULL<<k*2) - 1;
     
     // Safely access var_locs
@@ -1161,7 +1176,8 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
             int i;
             for(i=0;i<4;i++){
                 // if(next_nodes[i].cov >=a_cov && next_nodes[i].cov <= b_cov){
-                if(next_nodes[i].cov >=a_cov){
+                // Check both min and max coverage limits (max limit only if > 0)
+                if(next_nodes[i].cov >=a_cov && (max_assem_cov <= 0 || next_nodes[i].cov <= max_assem_cov)){
                     //print_uint64_kmer(next_nodes[i].kmer, k);
                     //print_uint64_kmer(kmer_t, k);
                     if( next_nodes[i].kmer == kmer_t){ // if the k-mer is equal to kmer_t, then 
@@ -1201,7 +1217,7 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
 int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min_cov, int assem_min_cov){ 
     debug_print("##### var_analysis_ref() \n");
     // debuging scripts
-    uint64_t mask = (1ULL<<eva->k*2) - 1;
+    // uint64_t mask = (1ULL<<eva->k*2) - 1;
     
     // Check for NULL pointers or invalid indices
     if (!eva || !eva->var_locs || !eva->kms || var_loc_p < 0) {
@@ -1275,10 +1291,10 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
         
         output_path(eva, var_loc_p, best_termnode_index);
         
-        if (good_term_node_num > 1) {
-            fprintf(stdout, "\tMultiple-path");
-        }
-        fprintf(stdout, "\n");
+        // if (good_term_node_num > 1) {
+        //     fprintf(stdout, "\tMultiple-path");
+        // }
+        // fprintf(stdout, "\n");
     }else{
         // Output the location failed assembly to a separate file
         static FILE *low_quality_fp = NULL;
@@ -1315,7 +1331,6 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
 
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num){
     debug_print("\n ###best_term_node() \n");
-    int k = eva->k;
     int i = 0, best_path=0, short_path_var_len = 10000, short_path_cov = 1;
     int p_path_node_num, var_len=0, p_path_cov;
 
@@ -1323,7 +1338,7 @@ int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num){
         p_path_node_num = path_node_num(good_term_nodes[i]);
         var_len = abs(p_path_node_num -ref_node_num) ;
         p_path_cov = nodes_path_cov(eva, good_term_nodes[i]);
-        if(var_len < short_path_var_len || p_path_node_num == short_path_var_len && p_path_cov > short_path_cov){
+        if(var_len < short_path_var_len || (p_path_node_num == short_path_var_len && p_path_cov > short_path_cov)){
             best_path = i;
             short_path_var_len = var_len;
             short_path_cov = p_path_cov;
@@ -1350,8 +1365,6 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     }
     
     // Add bounds checking to prevent going out of array bounds
-    int original_pos_s = var_loc->pos_s;
-    int original_pos_t = var_loc->pos_t;
     
     var_loc->pos_s = var_loc->pos_s - dis;
     if (var_loc->pos_s < 0) {
@@ -1418,7 +1431,7 @@ int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, in
     // fprintf(stdout, "Cov_t: %d \n", cov_t);
 
     int shift_time = 0;
-    while(cov_s > assem_min_cov && cov_t/cov_s > 2.8 || rep_km_num > 2 && shift_time <= k){
+    while(cov_s > assem_min_cov && (cov_t/cov_s > 2.8 || (rep_km_num > 2 && shift_time <= k))){
         cov_s = kmer_cov(min_hash_key(kms[var_loc->pos_s - 1],k), mask, eva->h);
         if(cov_s >= assem_min_cov && cov_s > 0){
             var_loc->pos_s = var_loc->pos_s -1;
@@ -1442,7 +1455,6 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
     pldat_t pl;
     gzFile fp;
     int k = eva->k;
-    int p = eva->p;
 
     if ((fp = gzopen(fn, "r")) == 0) return 0;
     pl.ks = kseq_init(fp);
@@ -1568,7 +1580,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
     // Sort variations by chromosome (sequence name) and position
     qsort(eva->variations, eva->var_count, sizeof(variation_t), compare_variations);
   
-    int curr_var_idx = 0; // Keep track of current variation index
+    // No longer tracking curr_var_idx; removed unused variable
     
     while (kseq_read(seq) >= 0) {
         char *seqname = seq->name.s;
@@ -1634,7 +1646,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     }
                     // Replace REF with ALT
                     memcpy(&sequence[pos], var->alt, alt_len);
-                    fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
                 } else if (strcmp(var->type, "INS") == 0) {
                     // Insert ALT after POS (VCF format)
                     int ref_len = strlen(var->ref);
@@ -1676,7 +1688,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     sequence = new_seq;
                     len += ins_len;
                     
-                    fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
                 } else if (strcmp(var->type, "DEL") == 0) {
                     int ref_len = strlen(var->ref);
                     int alt_len = strlen(var->alt);
@@ -1699,7 +1711,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
                     memmove(&sequence[pos + alt_len], &sequence[pos + ref_len], len - pos - ref_len + 1); // +1 for null terminator
                     len -= del_len;
                     
-                    fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
+                    // fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
                 }
             }
             
@@ -1726,46 +1738,36 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
 {
-    int i, c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, assem_min_cov = 4, insert_size = 1000;
+    int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 2, assem_min_cov = 5, insert_size = 1000;
     float error_rate = 0.025f;
-    int num_iters = 2;  // Default number of iterations
+    int num_iters = 3;  // Default number of iterations
+    int max_assem_cov = 0; // Default: no max coverage limit
     char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
     int fix_enabled = 0;
     static ko_longopt_t long_options[] = {
-        { "fix", ko_optional_argument, 128 },  // Change to optional argument
+        { "fix", ko_optional_argument, 128 },
         { 0, 0, 0 }
     };
-    char *fix_output = "fixed_reference.fna";  // Default output name
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:", long_options)) >= 0) {
+    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:m:", long_options)) >= 0) { // Added 'm:'
         if (c == 'k') k = atoi(o.arg);
-        //else if (c == 'p') p = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
         else if (c == 'a') assem_min_cov = atoi(o.arg);  // New option for assembly min coverage
+        else if (c == 'm') max_assem_cov = atoi(o.arg); // Parse max assembly coverage
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
         else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
-        else if (c == 128) {  // Handle --fix
+        else if (c == 128) {
             fix_enabled = 1;
-            if (o.arg) {
-                fix_output = o.arg;
-            } else {
-                // Generate default output name from reference filename
-                const char *base = argv[o.ind];
-                size_t blen = strlen(base);
-                char *def = malloc(blen + 7);
-                snprintf(def, blen + 7, "%s.fixed", base);
-                fix_output = def;
-            }
         }
         else if (c == 'o') output_base = o.arg;
     }
 
     if (argc - o.ind < 2) {
-        usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate);
+        usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov); // Pass max_assem_cov
         return 1;
     }
 
@@ -1795,7 +1797,7 @@ int main(int argc, char *argv[])
     
     fprintf(stderr, "Counting k-mers of NGS file 1  ......\n");
     
-    kc_c4x_t *h, *hr, *hr_pos;
+    kc_c4x_t *h, *hr;
     h = count_file(argv[o.ind + 1], k, p, block_size, n_thread);
     
     int c_f_n = 2;
@@ -1817,11 +1819,11 @@ int main(int argc, char *argv[])
     evaluation_t eva;
     eva.h = h;
     eva.hr = hr;
-    eva.hr_pos = hr_pos;
     eva.k = k;
     eva.p = p;
     eva.error_rate = error_rate;
     eva.fix_enabled = fix_enabled;
+    eva.max_assem_cov = max_assem_cov; // Set max coverage in eva struct
     eva.var_count = 0;
     eva.var_capacity = 0;
     eva.variations = NULL;
@@ -1838,7 +1840,17 @@ int main(int argc, char *argv[])
             continue;
         }
         
-        fprintf(vcf_fp, "##fileformat=VCF\n#CHROM\tPOS\tID\tREF\tALT\tk-mer coverage\tType\tAdditional info\n");
+        fprintf(vcf_fp, "##fileformat=VCFv4.5\n");
+        fprintf(vcf_fp, "##ProGenFixerVersion=v1.0\n");
+        fprintf(vcf_fp, "##ProGenFixerCommand=");
+        for (int i = 0; i < argc; i++) {
+            fprintf(vcf_fp, "%s%s", argv[i], (i == argc - 1) ? "" : " ");
+        }
+        fprintf(vcf_fp, "\n");
+
+        fprintf(vcf_fp, "##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description=\"K-mer coverage of the variant path\">\n");
+        fprintf(vcf_fp, "##INFO=<ID=VARTYPE,Number=1,Type=String,Description=\"Variant type (INS, DEL, SUB)\">\n");
+        fprintf(vcf_fp, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
 
         // Count current reference k-mers
         fprintf(stderr, "Counting k-mers in reference for iteration %d...\n", iter);
@@ -1905,29 +1917,30 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate) {
+void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov) { // Added max_assem_cov parameter
     fprintf(stderr, "\n");
-    fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer for haploid genomes\n");
-    fprintf(stderr, "Version 20240412  Author: Lifu Song songlf@tib.cas.cn\n");
+    fprintf(stderr, "ProGenFixer: an ultra-fast and accurate tool for correcting prokaryotic genome sequences using a mapping-free algorithm\n");
+    fprintf(stderr, "Version v1.0  Author: Lifu Song songlf@tib.cas.cn\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Usage: ProGenFixer [options] Reference NGS_files -o output_prefix\n");
     fprintf(stderr, "       [Supporting formats: fq, fa, fq.gz, fa.gz]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
-    fprintf(stderr, "  -c INT     minimal k-mer coverage for variant calling [%d]\n", min_cov);
-    fprintf(stderr, "  -a INT     minimal k-mer coverage for assembly [%d]\n", assem_min_cov);
+    fprintf(stderr, "  -c INT     minimal k-mer coverage for identifying variation regions [%d]\n", min_cov);
+    fprintf(stderr, "  -a INT     minimal k-mer coverage for assemble-based variant calling [%d]\n", assem_min_cov);
+    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov); // Added -m description
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
-    fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
-    fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
+    // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
+    fprintf(stderr, "  -n INT     number of correction iterations [3]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -a 5 --fix\n");
-    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -n 3 --fix\n");
+    fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -m 100 -n 3 --fix\n"); // Added example with -m
     fprintf(stderr, "\n");
 }
 
