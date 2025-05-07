@@ -1740,7 +1740,7 @@ int main(int argc, char *argv[])
 {
     int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 2, assem_min_cov = 5, insert_size = 1000;
     float error_rate = 0.025f;
-    int num_iters = 2;  // Default number of iterations
+    int num_iters = 3;  // Default number of iterations
     int max_assem_cov = 0; // Default: no max coverage limit
     char *output_base = NULL;
 
@@ -1933,7 +1933,7 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
     // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
-    fprintf(stderr, "  -n INT     number of correction iterations [2]\n");
+    fprintf(stderr, "  -n INT     number of correction iterations [3]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "\n");

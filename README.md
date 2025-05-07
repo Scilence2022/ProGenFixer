@@ -55,7 +55,7 @@ Where:
 - `-l INT` : maximal assembly length for variant calling (default: 1000)
 - `-t INT` : number of threads for k-mer counting (default: 3)
 - `-o STR` : base name for output files (required)
-- `-n INT` : number of correction iterations (default: 2)
+- `-n INT` : number of correction iterations (default: 3)
 - `--fix [FILE]` : Correct reference genome using detected variants (default output: fixed_reference.fna)
 
 ### Examples
