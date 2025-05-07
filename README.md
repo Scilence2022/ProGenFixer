@@ -1,6 +1,6 @@
 # ProGenFixer
 
-ProGenFixer is a tool for detecting and correcting variants in prokaryotic genomes without the need for read mapping. It uses k-mer based analysis to identify variations between a reference genome and NGS data, and can automatically fix the reference genome based on the detected variants.
+ProGenFixer is a super-fast and accurate tool for detecting and correcting variants in prokaryotic genomes without the need for read mapping. It uses k-mer based analysis to identify variations between a reference genome and NGS data, and can automatically fix the reference genome based on the detected variants.
 
 ## Features
 
@@ -101,16 +101,31 @@ Where `<output_base>` is the value specified with `-o` option, and `<N>` is the 
 
 ## VCF Format
 
-ProGenFixer outputs variants in VCF format. The columns are:
+ProGenFixer outputs variants in VCF format (VCFv4.5 compatible). The VCF files include the following header information:
+
+```
+##fileformat=VCFv4.5
+##ProGenFixerVersion=v1.0
+##ProGenFixerCommand=[command line used]
+##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description="K-mer coverage of the variant path">
+##INFO=<ID=VARTYPE,Number=1,Type=String,Description="Variant type (INS, DEL, SUB)">
+```
+
+The VCF records contain the standard columns:
 
 1. CHROM: Chromosome/contig name
 2. POS: Position in the reference (1-based)
-3. ID: Variant identifier (usually ".")
+3. ID: Variant identifier (always "." in current implementation)
 4. REF: Reference allele
 5. ALT: Alternative allele
-6. k-mer coverage: Coverage of the variant k-mer
-7. Type: Type of variant (SUB, INS, DEL)
-8. Additional info: Extra information about the variant
+6. QUAL: Quality score (always "." in current implementation)
+7. FILTER: Filter status (always "PASS" in current implementation)
+8. INFO: Additional information in the format `KMER_COV=<value>;VARTYPE=<type>`
+
+Where `<type>` is one of:
+- SUB: Substitution
+- INS: Insertion
+- DEL: Deletion
 
 ## How It Works
 
@@ -138,7 +153,13 @@ Song et al. (2025). ProGenFixer: an ultra-fast and accurate tool for correcting 
 
 ## License
 
-[License information]
+ProGenFixer is licensed under the GNU General Public License v3.0 (GPL-3.0).
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 ## Contact
 
