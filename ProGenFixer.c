@@ -1919,8 +1919,8 @@ int main(int argc, char *argv[])
 
 void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov) { // Added max_assem_cov parameter
     fprintf(stderr, "\n");
-    fprintf(stderr, "ProGenFixer: Prokaryotic Genome Fixer\n");
-    fprintf(stderr, "Version v1.0 (20250425)  Author: Lifu Song songlf@tib.cas.cn\n");
+    fprintf(stderr, "ProGenFixer: an ultra-fast and accurate tool for correcting prokaryotic genome sequences using a mapping-free algorithm\n");
+    fprintf(stderr, "Version v1.0  Author: Lifu Song songlf@tib.cas.cn\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Usage: ProGenFixer [options] Reference NGS_files -o output_prefix\n");
     fprintf(stderr, "       [Supporting formats: fq, fa, fq.gz, fa.gz]\n");
