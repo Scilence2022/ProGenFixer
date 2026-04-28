@@ -475,7 +475,15 @@ typedef struct { // data structure for file evaluation
     int extent_recursion_depth;  // Moved from static for thread safety
 
     // Back-fill (unique NGS k-mer analysis) state
-    u64set_t *used_kmers;    // canonical NGS k-mers already consumed by a path
+    u64set_t *used_kmers;    // canonical NGS k-mers that are "anchor-eligible":
+                             //   * consumed by an accepted variant-calling path, or
+                             //   * lying on an accepted back-fill novel path.
+                             // These are the only non-reference k-mers that may
+                             // serve as anchors for a back-fill greedy walk.
+    u64set_t *contam_kmers;  // canonical NGS k-mers flagged as contamination by a
+                             // previous back-fill attempt. Kept separate so they
+                             // are NOT treated as anchors, but still skipped to
+                             // avoid redundant re-analysis within an iteration.
     int backfill_max_ext;    // maximum extension length (in k-mer steps) per side
     int backfill_min_cov;    // minimal NGS coverage during greedy walk
     int n_backfill_novel;    // stats: novel paths found this iteration
@@ -1479,13 +1487,30 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 
 
 // ===================================================================
-// Back-fill process: analyze NGS-unique k-mers not consumed by variant
-// calling. For each unused canonical k-mer present in NGS but missing
-// from the current reference, greedily extend the unitig in both
-// directions on the NGS De Bruijn graph until reference anchors are
-// reached on both sides. Paths that reach reference k-mers on both
-// sides are reported as novel sequences; otherwise the starting k-mer
-// is flagged as contamination.
+// Back-fill process: recover variation signals that the reference-anchored
+// variant caller did not consume. The set of candidate starting k-mers is
+// the intersection of three conditions:
+//   (1) canonical k-mer is present in NGS with coverage >= backfill_min_cov;
+//   (2) canonical k-mer is NOT present in the current reference;
+//   (3) canonical k-mer has NOT already been consumed by a previously
+//       accepted variant path or accepted back-fill path, and has NOT
+//       already been flagged as contamination earlier in this iteration.
+// Note: condition (3) is essential. Variant-calling path assembly does
+// consume non-reference k-mers (the alt-allele portion of a variant path),
+// so "present in NGS but missing from the reference" alone is NOT the
+// correct candidate set.
+//
+// For each candidate starting k-mer, greedily extend the unitig in both
+// directions on the NGS De Bruijn graph. An anchor is reached when the
+// walk meets (a) a reference k-mer, or (b) a k-mer already on an accepted
+// variant/back-fill path (i.e. an element of eva->used_kmers). A walk that
+// runs into a contamination-flagged k-mer (eva->contam_kmers) is NOT
+// considered anchored, because such a k-mer has already been shown to fail
+// the anchoring test. Paths that reach an anchor on both sides are reported
+// as novel sequences, and every k-mer along the accepted path is added to
+// used_kmers. Paths that fail to anchor on at least one side mark ONLY the
+// starting k-mer as contamination; intermediate k-mers on the failed walk
+// are left untouched so they can still be analyzed on their own merit.
 // ===================================================================
 
 // Greedy unitig-style walk on the NGS De Bruijn graph.
@@ -1532,8 +1557,11 @@ static int backfill_extend(evaluation_t *eva, uint64_t start_fwd, int direction,
         path_out[(*path_len_out)++] = y;
         uint64_t y_can = min_hash_key(y, k);
 
-        // If this canonical k-mer is already on an accepted path, treat it
-        // as an anchor so the novel region joins cleanly with known paths.
+        // If this canonical k-mer is already on an accepted variant path or
+        // accepted back-fill novel path, treat it as a valid anchor so the
+        // novel region joins cleanly with known paths. Note: contamination
+        // k-mers are stored in eva->contam_kmers (NOT used_kmers) and must
+        // NOT satisfy this anchor condition.
         if (u64set_contains(eva->used_kmers, y_can)) {
             *anchor_out = y_can;
             return 1;
@@ -1606,8 +1634,15 @@ static void backfill_unique_kmers(evaluation_t *eva)
 
             eva->n_backfill_unique++;
 
-            // Skip k-mers already consumed by a variant or previous back-fill path.
+            // Skip k-mers already consumed by a variant or previous accepted
+            // back-fill path (anchor-eligible), as well as k-mers already
+            // flagged as contamination within this iteration. The two sets
+            // are tracked separately because only used_kmers may act as
+            // anchors in backfill_extend; contam_kmers is merely a memo to
+            // avoid redundant re-analysis.
             if (u64set_contains(eva->used_kmers, y_can)) continue;
+            if (eva->contam_kmers != NULL &&
+                u64set_contains(eva->contam_kmers, y_can)) continue;
 
             // Try both strand orientations; keep the first that anchors on both sides.
             uint64_t orientations[2];
@@ -1682,6 +1717,12 @@ static void backfill_unique_kmers(evaluation_t *eva)
                 free(seq_buf);
             } else {
                 // Contamination: cannot reach reference anchors on both sides.
+                // IMPORTANT: only the starting k-mer is flagged; the k-mers
+                // traversed by the failed walk are NOT marked, so they remain
+                // candidates in subsequent iterations of this loop. The flag
+                // is stored in contam_kmers (NOT used_kmers) so that a later
+                // walk which happens to step onto this k-mer is treated as a
+                // dead-end/continuation target rather than a valid anchor.
                 unsigned char kseq[128];
                 uint64_acgt(y_can, kseq, k); kseq[k] = '\0';
                 const char *reason;
@@ -1689,7 +1730,9 @@ static void backfill_unique_kmers(evaluation_t *eva)
                 else if (r_right_last != 1)               reason = "RIGHT_FAIL";
                 else                                       reason = "LEFT_FAIL";
                 fprintf(contam_fp, "%s\t%d\t%s\n", kseq, cov, reason);
-                u64set_add(eva->used_kmers, y_can);
+                if (eva->contam_kmers != NULL) {
+                    u64set_add(eva->contam_kmers, y_can);
+                }
                 eva->n_backfill_contam++;
             }
         }
@@ -1825,6 +1868,7 @@ int main(int argc, char *argv[])
 
     // Back-fill state
     eva.used_kmers = u64set_init();
+    eva.contam_kmers = u64set_init();
     eva.backfill_min_cov = backfill_min_cov_override > 0 ? backfill_min_cov_override : assem_min_cov;
     eva.backfill_max_ext = backfill_max_ext > 0 ? backfill_max_ext : insert_size;
 
@@ -1884,6 +1928,10 @@ int main(int argc, char *argv[])
             u64set_destroy(eva.used_kmers);
         }
         eva.used_kmers = u64set_init();
+        if (eva.contam_kmers != NULL) {
+            u64set_destroy(eva.contam_kmers);
+        }
+        eva.contam_kmers = u64set_init();
 
         // Run analysis
         fprintf(stderr, "Running analysis for iteration %d...\n", iter);
@@ -1941,6 +1989,10 @@ int main(int argc, char *argv[])
     if (eva.used_kmers != NULL) {
         u64set_destroy(eva.used_kmers);
         eva.used_kmers = NULL;
+    }
+    if (eva.contam_kmers != NULL) {
+        u64set_destroy(eva.contam_kmers);
+        eva.contam_kmers = NULL;
     }
     // Free NGS k-mer hash
     for (int i = 0; i < (1<<p); i++) {
