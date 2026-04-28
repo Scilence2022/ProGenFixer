@@ -317,53 +317,30 @@ static kc_c4x_t *count_file2(const char *fn, kc_c4x_t *hh, int k, int p, int blo
 int kmer_cov(uint64_t kmer, uint64_t mask, kc_c4x_t *h){
 
     int j, x, cov=0, a_key;
-    //unsigned cov=0;
     uint64_t hash_key = hash64(kmer, mask);
     j = hash_key & ((1<<KC_BITS) - 1);
     if(kh_size(h->h[j]) < 1){return 0;}
 
-    //debug_print("kmer_cov here A\n");
-
     hash_key = hash_key >> KC_BITS<< KC_BITS;
-
-    //debug_print("kmer_cov here B\n");
-
     x = kc_c4_get(h->h[j], hash_key);
 
-    //debug_print("kmer_cov here C, j=%d\t",j);
-    //debug_print("x=%d\n",x);
-
-    //cov = 1004797953 & 16383;
-    //cov = 1;
-    //debug_print("kmer_cov here E, cov=%d\n", cov);
-
-    //if(x == 0){return 0;} //To avoid of segment fault
-    // if(x == 0){if(kh_size(h->h[j]) < 1){return 0;}} //To avoid of segment fault
     if(kh_exist(h->h[j], x)){
-        //fprintf(stdout, "kmer_cov here D\n");
         a_key = kh_key(h->h[j], x); 
-        //fprintf(stdout, "kmer_cov here E, a_key=%d\n", a_key);
-        //fprintf(stdout, "kmer_cov here E, KC_MAX=%d\n", KC_MAX);
         cov = a_key & KC_MAX;
-
     }else{
-        //fprintf(stdout, "kmer_cov here E\n");
         return 0;
     }
    
-    // fprintf(stdout, "kmer_cov here F\n");
-    // fprintf(stdout, "kmer_cov here G, cov=%d\n", cov);
     return cov;
 }
 
 
-static inline void __attribute__((unused)) add_kmer(uint64_t y, uint64_t mask, kc_c4x_t *h) //add k-mer to hash set
+static inline void __attribute__((unused)) add_kmer(uint64_t y, uint64_t mask, kc_c4x_t *h)
 {
     int p = h->p;
     uint64_t y_hash = hash64(y, mask);
     int pre = y_hash & ((1<<p) - 1);
     khint_t k;
-//        fprintf(stdout, "work for j %d\t", i);
     int absent;
     k = kc_c4_put(h->h[pre], y_hash>>p<<KC_BITS, &absent);
     if ((kh_key(h->h[pre], k) & KC_MAX) < KC_MAX) ++kh_key(h->h[pre], k);
@@ -585,19 +562,14 @@ int compare_variations(const void *a, const void *b) {
 }
 
 int path_node_num(path_node *term_node){
-    // fprintf(stderr, "##### path_node_num() \n");
     path_node *p_node;
     int node_num=1;
     p_node = term_node;
 
-    // fprintf(stderr, "hello pathnode while \n");
-
     while(p_node->pre_node){
-        // fprintf(stderr, "hello pathnode while \n");
         node_num++;
         p_node = p_node->pre_node;
     }
-    // fprintf(stderr, "##### path_node_num: %d \n", node_num);
     return node_num;
 }
 
@@ -606,44 +578,27 @@ int nodes_path(path_node *term_node, unsigned char *path_seq, int k){
     path_node *p_node = term_node;
     int path_len = path_node_num(p_node);
 
-    // fprintf(stdout, "\n\nnodes_path function start here\n");
-    // fprintf(stdout, "path node num: %d\n", path_len);
-
     int passed_nodes = 0;   
-    // print_uint64_kmer(p_node->kmer, km_len);
-    //p_node = p_node->pre_node; //Skipping the terminal kmer 
     while(p_node->pre_node && passed_nodes < k - 1){
         p_node = p_node->pre_node;
-        // print_uint64_kmer(p_node->kmer, km_len);
-        //*(path_seq + path_seq_p) = (unsigned char)nt4_seq_table[p_node->kmer & 3ULL]; 
         passed_nodes++;
     }
 
 
-    // fprintf(stdout, "\n\nnnode after moving:\n");
-    // print_uint64_kmer(p_node->kmer, km_len);
-
     int path_seq_p = path_len-passed_nodes-2;   
-    //p_node = p_node->pre_node; //Skipping the terminal kmer 
     while(p_node->pre_node && path_seq_p >= 0){
         p_node = p_node->pre_node;
-        // print_uint64_kmer(p_node->kmer, km_len);
-        // fprintf(stdout, "nodes path function: %d\n", path_seq_p - 1);
         *(path_seq + path_seq_p - 1) = (unsigned char)nt4_seq_table[p_node->kmer & 3ULL]; 
-        // fprintf(stdout, "nodes path function: %c\n", (unsigned char)nt4_seq_table[p_node->kmer & 3ULL]);
         path_seq_p--;
     }
     return path_len;
 }
 
-// Working on 20230131 Lifu Song
 uint64_t* nodes_to_kms(path_node *term_node, int k){
-    // fprintf(stderr, "##### nodes_to_kms() \n");
     path_node *p_node = term_node;
     uint64_t *kms;
 
     int path_len = path_node_num(p_node);
-    // fprintf(stderr, "##### nodes_to_kms() path_len: %d\n", path_len);
 
     MALLOC(kms, path_len);
 
@@ -660,7 +615,6 @@ uint64_t* nodes_to_kms(path_node *term_node, int k){
 
 
 int nodes_path_cov( evaluation_t *eva, path_node *term_node){
-    // fprintf(stderr, "nodes_path_cov() function ...... \n");
     kc_c4x_t *h = eva->h;
     path_node *p_node = term_node;
     int k = eva->k;
@@ -669,8 +623,6 @@ int nodes_path_cov( evaluation_t *eva, path_node *term_node){
 
     int path_cov = kmer_cov(min_hash_key(p_node->kmer, k),mask,h);
     int passed_nodes = 0, p_node_cov = 0;   
-
-    
     while(p_node->pre_node && passed_nodes < k - 1){
         p_node = p_node->pre_node;
         p_node_cov = kmer_cov(min_hash_key(p_node->kmer, k),mask,h);
@@ -684,7 +636,6 @@ int nodes_path_cov( evaluation_t *eva, path_node *term_node){
 
 
 float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
-    
     kc_c4x_t *h = eva->h;
     path_node *p_node = term_node;
     int k = eva->k;
@@ -692,9 +643,7 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
     uint64_t mask = (1ULL<<k*2) - 1; //
     int path_len = path_node_num(p_node);
     int path_cov = kmer_cov(min_hash_key(p_node->kmer, k),mask,h);
-    int passed_nodes = 0, p_node_cov = 0;   
-
-    
+    int passed_nodes = 0, p_node_cov = 0;
 
     while(p_node->pre_node && passed_nodes < k - 1){
         p_node = p_node->pre_node;
@@ -707,7 +656,6 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
 
     float p_kmer = pow(1-error_rate,2*k) * pow(error_rate/3.0, path_len-k-1);
     float p_value = pow(p_kmer,path_cov);
-    //fprint(stderr, "dfasdfasdf\n");
     return p_value;
 }
 
@@ -715,57 +663,32 @@ float nodes_path_p_value( evaluation_t *eva, path_node *term_node){
 
 
 unsigned char* kms_to_seq(unsigned char *aseq, uint64_t *kms, int start, int term){
-    
     int i=0, l = term-start+1;
-    //CALLOC(aseq, l);
-    // fprintf(stdout, "ss: %d\t", ss);
-    // fprintf(stdout, "tt: %d\n", tt);
-
     while(i<l){
-        //print_uint64_kmer(kms[ss + i], 21);
         int n = kms[start + i] % 4;
         *(aseq + i)  = nt4_seq_table[n];
-        // fprintf(stdout, "nt4 seq table: %d\n", (int) kms[i] & 3ULL);
-        //fprintf(stdout, "%d\t", n);
-        //fprintf(stdout, "%c\n", nt4_seq_table[n]);
         i = i + 1;
     }
     aseq[l] = '\0';
     return aseq;
 }
 
-// Global arrays removed - now in evaluation_t struct for thread safety
 
-// 
 int slim_path(evaluation_t *eva, var_location *a_var, var_location *new_var, uint64_t *path_kms, int path_nodes_num){
-    // fprintf(stderr, "##### slim_path() \n");
-    
-
-    //int slim_path_len = path_len;
-    //fprintf(stderr, "##### slim_path_len: %d \n", path_len);
-    // MALLOC(slim_kms, slim_path_len); 
-
-    //var_location new_var;
     new_var->pos_s = 0;
     new_var->pos_t = path_nodes_num - 1;
  
     int pad_l = 0, pad_r = 0;
 
-    //Slim right
+    // Slim right
     while(eva->kms[a_var->pos_t - pad_r] == path_kms[path_nodes_num - 1 - pad_r] &&  path_nodes_num - pad_l - pad_r > eva->k && a_var->pos_t - a_var->pos_s - pad_l - pad_r > eva->k){
-    //while(eva->kms[a_var->pos_t - pad_r] == path_kms[path_nodes_num - 1 - pad_r]){
         pad_r++;
-        // fprintf(stdout, "##### pad_r: %d \n", pad_r);
     }
     
-    //fprintf(stderr, "##### Hello \n");
-    //Slim left
+    // Slim left
     while(eva->kms[a_var->pos_s + pad_l] == path_kms[pad_l]                      && path_nodes_num - pad_l - pad_r > eva->k && a_var->pos_t - a_var->pos_s - pad_l - pad_r > eva->k ){
-    //while(  eva->kms[a_var->pos_s + pad_l] == path_kms[pad_l] ){
         pad_l++;
-        // fprintf(stdout, "##### pad_l: %d \n", pad_l);
     }
-    //if(pad_l > 0){pad_l--;}
     
     if(pad_r > 0){pad_r--;}
     if(pad_l > 0){pad_l--;}
@@ -794,60 +717,23 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     ref_var.pos_s = eva->var_locs[var_loc_p].pos_s;
     ref_var.pos_t = eva->var_locs[var_loc_p].pos_t;
 
-    // int ref_pos_s = eva->var_locs[var_loc_p].pos_s;
-    // int ref_pos_t = eva->var_locs[var_loc_p].pos_t;
-
     path_node *p_node = eva->good_term_nodes[path_index];
     int path_nodes_num = path_node_num(eva->good_term_nodes[path_index]);
     
     uint64_t *path_kms = nodes_to_kms(p_node, k);
-    // uint64_t *slim_kms;
-    // fprintf(stdout, "##### path_nodes_num: %d\n", path_nodes_num);
 
     var_location seq_var;
-    //paded = if pad happend or not. 
-    // fprintf(stdout, "before slim, path node num: %d\n", path_nodes_num);
     slim_path(eva, &ref_var, &seq_var, path_kms, path_nodes_num);
 
-    // fprintf(stdout, "##### slim_path function finished\n");
-
-    // Removed unused variables start_pos and term_pos
-
-    // fprintf(stdout, "##### ref kmers\n");
-    // print_uint64_kmer(eva->var_locs[var_loc_p].kmer_s, k); 
-    // fprintf(stdout, "\t");
-    // print_uint64_kmer(eva->var_locs[var_loc_p].kmer_t, k); 
-    // fprintf(stdout, "\n");
-
-    // fprintf(stdout, "##### var kmers\n");
-    // print_uint64_kmer(ref_var.pos_s, k); 
-    // print_uint64_kmer(ref_var.pos_t, k); 
-
-    // fprintf(stdout, "##### ref_var.pos_s: %d \t", ref_var.pos_s);
-    // fprintf(stdout, " ref_var.pos_t: %d \t", ref_var.pos_t);
-    // fprintf(stdout, " new_var start_pos: %d \t", seq_var.pos_s);
-    // fprintf(stdout, " new_var term_pos: %d \n", seq_var.pos_t);
-    
-    // fprintf(stdout, "#Outputting the varation analysis results\n");
-
     int path_cov = nodes_path_cov(eva, eva->good_term_nodes[path_index]);
-
-    // fprintf(stdout, "##### nodes_path_cov() function finished\n");
 
     unsigned char *ref_seq;
     int ref_seq_len = ref_var.pos_t - ref_var.pos_s - k + 2;
     CALLOC(ref_seq, ref_seq_len + 10);
-    //kms_to_seq(ref_seq, eva->kms, ref_var.pos_s, ref_var.pos_t - k + 1 );
 
     unsigned char *path_seq;
     int slim_path_len = seq_var.pos_t - seq_var.pos_s - k + 2; 
-    CALLOC(path_seq, slim_path_len + 500); 
-    //kms_to_seq(path_seq, path_kms, seq_var.pos_s, seq_var.pos_t - k + 1 );
-    
-    // fprintf(stdout, "##### Here\n");
-    //slim_path_len = slim_path_len - k - 1;
-    // fprintf(stdout, "slim_path_len: %d\t", slim_path_len);
-    // fprintf(stdout, "ref_seq_len: %d\n", ref_seq_len);
+    CALLOC(path_seq, slim_path_len + 500);
 
     fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
     char info_field[200];
@@ -867,10 +753,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
         fprintf(eva->vcf_out, "%s", info_field);
 
     }
-    if(slim_path_len < ref_seq_len){ //Deletion
-        // ref_var.pos_s = ref_var.pos_s -1;
-        // seq_var.pos_s = seq_var.pos_s -1;
-        // ref_seq_len++; slim_path_len++;
+    if(slim_path_len < ref_seq_len){ // Deletion
         if(slim_path_len < 0){
             fprintf(stderr, "Slim Path less than 0 detected\n");
             kms_to_seq(ref_seq, eva->kms, ref_var.pos_s + slim_path_len + 1, ref_var.pos_t - k + 1 );
@@ -878,7 +761,6 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
-        //kms_to_seq(ref_seq, eva->kms, ref_var.pos_s, ref_var.pos_t - k + 1 );
         fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k ); // POS for DEL is 1-based pos before deletion
         fprintf(eva->vcf_out, ".\t"); // ID
         fprintf(eva->vcf_out, "%s\t", ref_seq); // REF
