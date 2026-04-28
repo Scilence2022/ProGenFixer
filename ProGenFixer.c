@@ -45,6 +45,25 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
 
 KHASHL_SET_INIT(, kc_c4_t, kc_c4, uint64_t, kc_c4_hash, kc_c4_eq)
 
+// Simple uint64 hash set for tracking NGS k-mers already consumed by variant
+// paths or back-fill paths. Canonical k-mers (min of forward/reverse) are
+// stored. Uses a multiplicative hash over the full 64-bit key.
+#define u64_hashfn(x) ((khint_t)(((x) ^ ((x) >> 32)) * 2654435769u))
+#define u64_equalfn(a, b) ((a) == (b))
+KHASHL_SET_INIT(, u64set_t, u64set, uint64_t, u64_hashfn, u64_equalfn)
+
+static inline int u64set_contains(u64set_t *s, uint64_t key) {
+    if (s == NULL) return 0;
+    khint_t it = u64set_get(s, key);
+    return it != kh_end(s);
+}
+
+static inline void u64set_add(u64set_t *s, uint64_t key) {
+    if (s == NULL) return;
+    int absent;
+    u64set_put(s, key, &absent);
+}
+
 #define CALLOC(ptr, len) do { \
     (ptr) = (__typeof__(ptr))calloc((len), sizeof(*(ptr))); \
     if ((ptr) == NULL) { fprintf(stderr, "Error: calloc failed at %s:%d\n", __FILE__, __LINE__); exit(1); } \
@@ -454,11 +473,22 @@ typedef struct { // data structure for file evaluation
     path_node **good_term_nodes;
     FILE *low_quality_fp;  // Moved from static for proper lifecycle management
     int extent_recursion_depth;  // Moved from static for thread safety
+
+    // Back-fill (unique NGS k-mer analysis) state
+    u64set_t *used_kmers;    // canonical NGS k-mers already consumed by a path
+    int backfill_max_ext;    // maximum extension length (in k-mer steps) per side
+    int backfill_min_cov;    // minimal NGS coverage during greedy walk
+    int n_backfill_novel;    // stats: novel paths found this iteration
+    int n_backfill_contam;   // stats: contamination k-mers this iteration
+    int n_backfill_unique;   // stats: total NGS-unique k-mers considered
 } evaluation_t;
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
 int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis);
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num);
+
+// Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
+static void backfill_unique_kmers(evaluation_t *eva);
 
 
 
@@ -726,6 +756,14 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     slim_path(eva, &ref_var, &seq_var, path_kms, path_nodes_num);
 
     int path_cov = nodes_path_cov(eva, eva->good_term_nodes[path_index]);
+
+    // Record every canonical k-mer along the chosen variant path as "used"
+    // so the back-fill phase will not re-analyze them.
+    if (eva->used_kmers != NULL) {
+        for (int pi = 0; pi < path_nodes_num; pi++) {
+            u64set_add(eva->used_kmers, min_hash_key(path_kms[pi], k));
+        }
+    }
 
     unsigned char *ref_seq;
     int ref_seq_len = ref_var.pos_t - ref_var.pos_s - k + 2;
@@ -1440,6 +1478,233 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 
 
 
+// ===================================================================
+// Back-fill process: analyze NGS-unique k-mers not consumed by variant
+// calling. For each unused canonical k-mer present in NGS but missing
+// from the current reference, greedily extend the unitig in both
+// directions on the NGS De Bruijn graph until reference anchors are
+// reached on both sides. Paths that reach reference k-mers on both
+// sides are reported as novel sequences; otherwise the starting k-mer
+// is flagged as contamination.
+// ===================================================================
+
+// Greedy unitig-style walk on the NGS De Bruijn graph.
+//   direction = +1 : extend forward  (append base to 3' end of y)
+//   direction = -1 : extend backward (prepend base to 5' end of y)
+// Returns 1 when a reference k-mer anchor is reached (anchor_out set to
+// the canonical form of that anchor), 0 when max_len is hit without
+// anchor, -1 when a dead-end is reached.
+static int backfill_extend(evaluation_t *eva, uint64_t start_fwd, int direction,
+                           int min_cov, int max_len,
+                           uint64_t *path_out, int *path_len_out,
+                           uint64_t *anchor_out)
+{
+    int k = eva->k;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    uint64_t shift = (uint64_t)(k - 1) * 2;
+    uint64_t y = start_fwd;
+    int steps = 0;
+    *path_len_out = 0;
+
+    while (steps < max_len) {
+        int best_b = -1, best_cov = 0;
+        uint64_t best_next = 0;
+        for (int b = 0; b < 4; b++) {
+            uint64_t nxt;
+            if (direction > 0) {
+                nxt = ((y << 2) | (uint64_t)b) & mask;
+            } else {
+                nxt = (y >> 2) | ((uint64_t)b << shift);
+            }
+            if (nxt == y) continue; // homopolymer self-loop guard
+            uint64_t can = min_hash_key(nxt, k);
+            int cov = kmer_cov(can, mask, eva->h);
+            if (cov >= min_cov && cov > best_cov) {
+                best_cov = cov;
+                best_next = nxt;
+                best_b = b;
+            }
+        }
+        if (best_b < 0) {
+            return -1; // dead-end in NGS graph
+        }
+        y = best_next;
+        path_out[(*path_len_out)++] = y;
+        uint64_t y_can = min_hash_key(y, k);
+
+        // If this canonical k-mer is already on an accepted path, treat it
+        // as an anchor so the novel region joins cleanly with known paths.
+        if (u64set_contains(eva->used_kmers, y_can)) {
+            *anchor_out = y_can;
+            return 1;
+        }
+
+        int rcov = kmer_cov(y_can, mask, eva->hr);
+        if (rcov > 0) {
+            *anchor_out = y_can;
+            return 1;
+        }
+        steps++;
+    }
+    return 0; // reached max length without anchor
+}
+
+static void backfill_unique_kmers(evaluation_t *eva)
+{
+    if (eva == NULL || eva->h == NULL || eva->hr == NULL || eva->output_base == NULL) {
+        return;
+    }
+    if (eva->used_kmers == NULL) return;
+
+    int k = eva->k;
+    int p = eva->h->p;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    int min_cov = eva->backfill_min_cov > 0 ? eva->backfill_min_cov : 2;
+    int max_ext = eva->backfill_max_ext > 0 ? eva->backfill_max_ext : 1000;
+
+    char novel_fn[512], contam_fn[512];
+    snprintf(novel_fn, sizeof(novel_fn), "%s.iter%d.novel.tsv",
+             eva->output_base, eva->iteration);
+    snprintf(contam_fn, sizeof(contam_fn), "%s.iter%d.contamination.tsv",
+             eva->output_base, eva->iteration);
+
+    FILE *novel_fp = fopen(novel_fn, "w");
+    FILE *contam_fp = fopen(contam_fn, "w");
+    if (novel_fp == NULL || contam_fp == NULL) {
+        fprintf(stderr, "Error: Could not open back-fill output files\n");
+        if (novel_fp) fclose(novel_fp);
+        if (contam_fp) fclose(contam_fp);
+        return;
+    }
+    fprintf(novel_fp, "#LEFT_ANCHOR\tRIGHT_ANCHOR\tSEQ_LEN\tSTART_KMER_COV\tSEQUENCE\n");
+    fprintf(contam_fp, "#KMER\tKMER_COV\tREASON\n");
+
+    uint64_t *left_path = NULL, *right_path = NULL;
+    MALLOC(left_path, max_ext + 2);
+    MALLOC(right_path, max_ext + 2);
+
+    eva->n_backfill_novel = 0;
+    eva->n_backfill_contam = 0;
+    eva->n_backfill_unique = 0;
+
+    // Iterate every NGS k-mer bucket.
+    for (int bi = 0; bi < (1 << p); bi++) {
+        kc_c4_t *bucket = eva->h->h[bi];
+        if (bucket == NULL) continue;
+        for (khint_t it = 0; it != kh_end(bucket); it++) {
+            if (!kh_exist(bucket, it)) continue;
+            uint64_t stored = kh_key(bucket, it);
+            int cov = (int)(stored & KC_MAX);
+            if (cov < min_cov) continue;
+
+            // Reconstruct canonical k-mer: stored = (hash64(can) >> p) << KC_BITS
+            uint64_t hash_val = ((stored >> KC_BITS) << p) | (uint64_t)bi;
+            uint64_t y_can = hash64i(hash_val, mask);
+
+            // Skip k-mers that appear in the reference.
+            if (kmer_cov(y_can, mask, eva->hr) > 0) continue;
+
+            eva->n_backfill_unique++;
+
+            // Skip k-mers already consumed by a variant or previous back-fill path.
+            if (u64set_contains(eva->used_kmers, y_can)) continue;
+
+            // Try both strand orientations; keep the first that anchors on both sides.
+            uint64_t orientations[2];
+            orientations[0] = y_can;
+            orientations[1] = comp_rev(y_can, k);
+
+            int anchored = 0;
+            int lpl = 0, rpl = 0;
+            uint64_t left_anchor = 0, right_anchor = 0;
+            int r_left_last = -1, r_right_last = -1;
+            uint64_t used_y_fwd = y_can;
+
+            for (int o = 0; o < 2; o++) {
+                int tmp_lpl = 0, tmp_rpl = 0;
+                uint64_t tmp_la = 0, tmp_ra = 0;
+                int r_right = backfill_extend(eva, orientations[o], +1,
+                                              min_cov, max_ext,
+                                              right_path, &tmp_rpl, &tmp_ra);
+                int r_left = backfill_extend(eva, orientations[o], -1,
+                                             min_cov, max_ext,
+                                             left_path, &tmp_lpl, &tmp_la);
+                r_left_last = r_left;
+                r_right_last = r_right;
+                if (r_left == 1 && r_right == 1) {
+                    anchored = 1;
+                    lpl = tmp_lpl;
+                    rpl = tmp_rpl;
+                    left_anchor = tmp_la;
+                    right_anchor = tmp_ra;
+                    used_y_fwd = orientations[o];
+                    break;
+                }
+            }
+
+            if (anchored) {
+                // Assemble novel sequence: left_path is in extension order
+                // (closest to start at index 0, leftmost at index lpl-1).
+                int seq_len = k + lpl + rpl;
+                unsigned char *seq_buf = NULL;
+                CALLOC(seq_buf, seq_len + 1);
+
+                uint64_t leftmost = (lpl > 0) ? left_path[lpl - 1] : used_y_fwd;
+                uint64_acgt(leftmost, seq_buf, k);
+                int sp = k;
+                for (int ii = lpl - 2; ii >= 0; ii--) {
+                    seq_buf[sp++] = nt4_seq_table[left_path[ii] & 3ULL];
+                }
+                if (lpl > 0) {
+                    seq_buf[sp++] = nt4_seq_table[used_y_fwd & 3ULL];
+                }
+                for (int ii = 0; ii < rpl; ii++) {
+                    seq_buf[sp++] = nt4_seq_table[right_path[ii] & 3ULL];
+                }
+                seq_buf[sp] = '\0';
+
+                unsigned char la_seq[128], ra_seq[128];
+                uint64_acgt(left_anchor, la_seq, k); la_seq[k] = '\0';
+                uint64_acgt(right_anchor, ra_seq, k); ra_seq[k] = '\0';
+
+                fprintf(novel_fp, "%s\t%s\t%d\t%d\t%s\n",
+                        la_seq, ra_seq, seq_len, cov, seq_buf);
+
+                // Mark every canonical k-mer along the accepted path as used.
+                u64set_add(eva->used_kmers, y_can);
+                for (int ii = 0; ii < lpl; ii++) {
+                    u64set_add(eva->used_kmers, min_hash_key(left_path[ii], k));
+                }
+                for (int ii = 0; ii < rpl; ii++) {
+                    u64set_add(eva->used_kmers, min_hash_key(right_path[ii], k));
+                }
+                eva->n_backfill_novel++;
+                free(seq_buf);
+            } else {
+                // Contamination: cannot reach reference anchors on both sides.
+                unsigned char kseq[128];
+                uint64_acgt(y_can, kseq, k); kseq[k] = '\0';
+                const char *reason;
+                if (r_left_last != 1 && r_right_last != 1) reason = "BOTH_SIDES_FAIL";
+                else if (r_right_last != 1)               reason = "RIGHT_FAIL";
+                else                                       reason = "LEFT_FAIL";
+                fprintf(contam_fp, "%s\t%d\t%s\n", kseq, cov, reason);
+                u64set_add(eva->used_kmers, y_can);
+                eva->n_backfill_contam++;
+            }
+        }
+    }
+
+    free(left_path);
+    free(right_path);
+    fclose(novel_fp);
+    fclose(contam_fp);
+    fprintf(stderr,
+            "Back-fill (iter %d): unique-NGS=%d, novel=%d, contamination=%d\n",
+            eva->iteration, eva->n_backfill_unique,
+            eva->n_backfill_novel, eva->n_backfill_contam);
+}
+
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
 {
@@ -1447,12 +1712,16 @@ int main(int argc, char *argv[])
     float error_rate = 0.025f;
     int num_iters = 3;  // Default number of iterations
     int max_assem_cov = 0; // Default: no max coverage limit
+    int backfill_enabled = 1; // Back-fill of unique NGS k-mers enabled by default
+    int backfill_max_ext = 0; // 0 => use insert_size
     char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
     int fix_enabled = 0;
     static ko_longopt_t long_options[] = {
         { "fix", ko_optional_argument, 128 },
+        { "no-backfill", ko_no_argument, 129 },
+        { "backfill-len", ko_required_argument, 130 },
         { 0, 0, 0 }
     };
     
@@ -1467,6 +1736,12 @@ int main(int argc, char *argv[])
         else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
         else if (c == 128) {
             fix_enabled = 1;
+        }
+        else if (c == 129) {
+            backfill_enabled = 0;
+        }
+        else if (c == 130) {
+            backfill_max_ext = atoi(o.arg);
         }
         else if (c == 'o') output_base = o.arg;
     }
@@ -1543,6 +1818,11 @@ int main(int argc, char *argv[])
     eva.low_quality_fp = NULL;
     eva.extent_recursion_depth = 0;
 
+    // Back-fill state
+    eva.used_kmers = u64set_init();
+    eva.backfill_min_cov = assem_min_cov;
+    eva.backfill_max_ext = backfill_max_ext > 0 ? backfill_max_ext : insert_size;
+
     char *current_ref = argv[o.ind];
     for (int iter = 1; iter <= num_iters; iter++) {
         // Open VCF output for this iteration
@@ -1592,10 +1872,24 @@ int main(int argc, char *argv[])
         eva.var_locs = NULL;
         eva.kms = NULL;
 
+        // Reset used-k-mer set at the start of each iteration: the
+        // reference changes between iterations so "unique NGS k-mers"
+        // are recomputed fresh.
+        if (eva.used_kmers != NULL) {
+            u64set_destroy(eva.used_kmers);
+        }
+        eva.used_kmers = u64set_init();
+
         // Run analysis
         fprintf(stderr, "Running analysis for iteration %d...\n", iter);
         analysis_ref_seq(&eva, current_ref, insert_size, min_cov, assem_min_cov);
         fclose(vcf_fp);
+
+        // Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
+        if (backfill_enabled) {
+            fprintf(stderr, "Running back-fill for iteration %d...\n", iter);
+            backfill_unique_kmers(&eva);
+        }
 
         // Apply corrections if we found any variations
         if (eva.var_count > 0) {
@@ -1639,6 +1933,10 @@ int main(int argc, char *argv[])
     if (eva.variations != NULL) {
         free(eva.variations);
     }
+    if (eva.used_kmers != NULL) {
+        u64set_destroy(eva.used_kmers);
+        eva.used_kmers = NULL;
+    }
     // Free NGS k-mer hash
     for (int i = 0; i < (1<<p); i++) {
         kc_c4_destroy(h->h[i]);
@@ -1673,6 +1971,8 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -n INT     number of correction iterations [3]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
+    fprintf(stderr, "  --no-backfill       disable back-fill of NGS-unique k-mers\n");
+    fprintf(stderr, "  --backfill-len INT  max extension length per side for back-fill [uses -l]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
