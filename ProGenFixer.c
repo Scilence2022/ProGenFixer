@@ -25,6 +25,12 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
 #define Max_Path_Num 1000
 //#define Max_Path_Len 1000
 #define Max_Cov_Ratio 3
+#define MAX_REP_KM_NUM 100
+#define MAX_COV_RATIO 100
+#define MAX_ALL_NODES (Max_Path_Num * 2000)
+#define LOW_COV_INIT 10000
+#define MAX_EXTENT_RECURSION 5
+#define MAX_EXTENT_DISTANCE 1000
 
 #define DEBUG 0
 
@@ -39,9 +45,18 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
 
 KHASHL_SET_INIT(, kc_c4_t, kc_c4, uint64_t, kc_c4_hash, kc_c4_eq)
 
-#define CALLOC(ptr, len) ((ptr) = (__typeof__(ptr))calloc((len), sizeof(*(ptr))))
-#define MALLOC(ptr, len) ((ptr) = (__typeof__(ptr))malloc((len) * sizeof(*(ptr))))
-#define REALLOC(ptr, len) ((ptr) = (__typeof__(ptr))realloc((ptr), (len) * sizeof(*(ptr))))
+#define CALLOC(ptr, len) do { \
+    (ptr) = (__typeof__(ptr))calloc((len), sizeof(*(ptr))); \
+    if ((ptr) == NULL) { fprintf(stderr, "Error: calloc failed at %s:%d\n", __FILE__, __LINE__); exit(1); } \
+} while (0)
+#define MALLOC(ptr, len) do { \
+    (ptr) = (__typeof__(ptr))malloc((len) * sizeof(*(ptr))); \
+    if ((ptr) == NULL) { fprintf(stderr, "Error: malloc failed at %s:%d\n", __FILE__, __LINE__); exit(1); } \
+} while (0)
+#define REALLOC(ptr, len) do { \
+    (ptr) = (__typeof__(ptr))realloc((ptr), (len) * sizeof(*(ptr))); \
+    if ((ptr) == NULL) { fprintf(stderr, "Error: realloc failed at %s:%d\n", __FILE__, __LINE__); exit(1); } \
+} while (0)
 
 const unsigned char seq_nt4_table[256] = { // translate ACGT to 0123
         0, 1, 2, 3,  4, 4, 4, 4,  4, 4, 4, 4,  4, 4, 4, 4,
@@ -77,7 +92,7 @@ static inline uint64_t hash64(uint64_t key, uint64_t mask) // invertible integer
 }
 
 // The inversion of hash64(). Modified from <https://naml.us/blog/tag/invertible>
-static inline uint64_t hash64i(uint64_t key, uint64_t mask) //
+static inline uint64_t __attribute__((unused)) hash64i(uint64_t key, uint64_t mask) //
 {
     uint64_t tmp;
     // Invert key = key + (key << 31)
@@ -111,40 +126,11 @@ unsigned char* uint64_acgt(uint64_t key, unsigned char* seq, unsigned char km_le
     return seq;
 }
 
-unsigned char* uint64_int8(uint64_t key, unsigned char* seq){
-    //decode uint_64_t kmer  to  char
-
-    uint64_t mask = (1ULL<<8)-1;
-    int i =0;
-    for(i =0; i< 8; i++){
-        *(seq+7-i) = key & mask;
-        mask = mask <<8;
-    }
-    return seq;
-}
-
-
-
-uint64_t comp_rev2(uint64_t x, unsigned char km_len){
-    uint64_t a, b=0ULL, mask = (1ULL<<km_len*2) - 1;
-
-    a = ~x; a = a & mask;
-    while((a & mask) > 0 ){
-        b = b<<2;
-        b = b + (a & 3ULL);
-        a = a>>2;
-    }
-//    b = ~b;
-    b = b & mask;
-    return b;
-}
-
+// Removed unused: uint64_int8, comp_rev2, actgkmer_uint64, actgkmer_hashkey,
+// uint8_actg, actg_uint8, actg_intseq, intseq_actg
+// Note: hash64i is the inverse of hash64, kept for potential future use
 
 uint64_t comp_rev(uint64_t x, unsigned char km_len){
-//    if (c < 4) { // not an "N" base
-//        x[0] = (x[0] << 2 | c) & mask;                  // forward strand
-//        x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;
-//    uint64_t y=0;// mask = (1ULL << km_len * 2) - 1;
     uint64_t y=0;
     int i, c;
     for(i=0;i<km_len;i++){
@@ -160,116 +146,6 @@ uint64_t comp_rev(uint64_t x, unsigned char km_len){
 uint64_t min_hash_key(uint64_t x, unsigned char km_len){
     uint64_t y = comp_rev(x, km_len);
     return (x < y) ? x:y;
-}
-
-
-uint64_t actgkmer_uint64(unsigned char* seq, unsigned char km_len){
-//    Just for testing
-//// Function verified 20210708 Lifu Song
-    int i;
-    uint64_t x, mask = (1ULL<<km_len*2) - 1; //shift = (km_len - 1) * 2
-    for (i = 0, x = 0; i < km_len; ++i) {
-        //fprintf(stdout, "%c ", seq[i]);
-        int c = seq_nt4_table[(uint8_t)seq[i]];
-        //fprintf(stdout, "%d ", c);
-        if (c < 4) { // not an "N" base
-            x = (x << 2 | c) & mask;                  // forward strand
-//            x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;  // reverse strand
-        } else x = 0; // if there is an "N", restart
-    }
-
-    //fprintf(stdout, "y %ld\n", x);
-    return x;
-}
-
-
-uint64_t actgkmer_hashkey(unsigned char* seq, unsigned char km_len){
-//// Function verified 20210708 Lifu Song
-    int i;
-    uint64_t x[2], y,  shift = (km_len - 1) * 2, mask = (1ULL<<km_len*2) - 1;
-    for (i = 0, x[0] = x[1] = 0; i < km_len; ++i) {
-        //fprintf(stdout, "%c ", seq[i]);
-        int c = seq_nt4_table[(uint8_t)seq[i]];
-        //fprintf(stdout, "%d ", c);
-        if (c < 4) { // not an "N" base
-            x[0] = (x[0] << 2 | c) & mask;                  // forward strand
-            x[1] = x[1] >> 2 | (uint64_t)(3 - c) << shift;  // reverse strand
-        } else x[0] = x[1] = 0; // if there is an "N", restart
-    }
-    y = x[0] < x[1]? x[0] : x[1];
-    //fprintf(stdout, "y %ld\n", y);
-    return y;
-}
-
-unsigned long uint8_actg(unsigned char bts){
-    unsigned int i=0;
-    unsigned long four_base_seq=0;
-
-    for(i =0 ; i < 4; ++i){
-        int m = bts & 3;
-        bts = bts >>2;
-        four_base_seq =four_base_seq >>8;
-        four_base_seq = four_base_seq + ((unsigned long)nt4_seq_table[m]<< 24);
-    }
-    return four_base_seq;
-}
-
-
-unsigned char actg_uint8(unsigned long actg_seq){
-    unsigned int i=0;
-    unsigned char uint8_value=0;
-
-    for(i =0 ; i < 4; ++i){
-        unsigned int m = actg_seq & 255;
-        actg_seq = actg_seq >> 8;
-        uint8_value = uint8_value >> 2;
-        uint8_value = uint8_value + ((unsigned char)seq_nt4_table[m]<<6);
-    }
-    return uint8_value;
-}
-
-void actg_intseq(unsigned char* actg_seq, unsigned char* int_seq, int8_t actg_seq_len){
-
-    int p = 0;
-    unsigned long n, n1, n2, n3, n4;
-    while(p < actg_seq_len-3){
-        n1 = actg_seq[p];
-        n2 = actg_seq[p+1];
-        n3 = actg_seq[p+2];
-        n4 = actg_seq[p+3];
-        n = (n1<<24) + (n2<<16) + (n3<<8) + n4;
-        int_seq[p>>2] = actg_uint8(n) ;
-        p = p + 4;
-    }
-    int_seq[p + 1] = '\0';
-}
-
-
-void intseq_actg(unsigned char* int_seq, unsigned char* actg_seq, int8_t int_seq_len){
-//// int seq to DNA seq
-//// Function not tested yet
-//// one char(byte) to four bases
-    int p = 0;
-    unsigned long n, mask;
-
-    unsigned char n1, n2, n3, n4;
-    while(p < int_seq_len){
-        mask= (1<<8) - 1;
-        n = uint8_actg(int_seq[p]) ;
-        n4 = (n & mask);
-        mask = mask <<8;
-        n3 = (n & mask)>>8;
-        mask = mask <<8;
-        n2 = (n & mask)>>16;
-        mask = mask <<8;
-        n1 = (n & mask)>>24;
-
-        actg_seq[p<<2] = n1;
-        actg_seq[(p<<2) + 1] = n2;
-        actg_seq[(p<<2) + 2] = n3;
-        actg_seq[(p<<2) + 3] = n4;
-        p = p + 1;
-    }
 }
 
 typedef struct {
@@ -481,7 +357,7 @@ int kmer_cov(uint64_t kmer, uint64_t mask, kc_c4x_t *h){
 }
 
 
-static inline void add_kmer(uint64_t y, uint64_t mask, kc_c4x_t *h) //add k-mer to hash set
+static inline void __attribute__((unused)) add_kmer(uint64_t y, uint64_t mask, kc_c4x_t *h) //add k-mer to hash set
 {
     int p = h->p;
     uint64_t y_hash = hash64(y, mask);
@@ -490,8 +366,7 @@ static inline void add_kmer(uint64_t y, uint64_t mask, kc_c4x_t *h) //add k-mer 
 //        fprintf(stdout, "work for j %d\t", i);
     int absent;
     k = kc_c4_put(h->h[pre], y_hash>>p<<KC_BITS, &absent);
-    ++kh_key(h->h[pre], k);
-    //if ((kh_key(h[pre], k)&KC_MAX) < KC_MAX) ++kh_key(h[pre], k);
+    if ((kh_key(h->h[pre], k) & KC_MAX) < KC_MAX) ++kh_key(h->h[pre], k);
 
 }
 
@@ -509,72 +384,28 @@ int insert_kms(uint64_t *kms, uint64_t y, int km_num) // insert a k-mer $y to a 
 
 
 
-int kms_max_cov(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
-    int i, max_cov=0;
-    //fprintf(stdout, "func kms_max_cov\n");
-    for(i=0; i<km_num; i++){
-            //printf("");
-            //fprintf(stdout, "uint64: %"PRIu64, *(kms+i));
-            //fprintf(stdout, "\n");
-            int cov = kmer_cov(*(kms+i), mask, h);
-            if(cov > max_cov){max_cov=cov;}
-    }
-    //printf("km_num: %d\n", km_num);
-    //printf("max cov: %d\n", max_cov);
-    return max_cov;
-}
+// Combined k-mer statistics (single-pass replacement for formerly separate functions)
+typedef struct {
+    int max_cov;
+    int min_cov;
+    int ext_num;  // number of k-mers with coverage > 0
+    int avg_cov;
+} kms_stats_t;
 
-int kms_min_cov(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
-    int i, min_cov=10000;
-    //fprintf(stdout, "func kms_max_cov\n");
-    for(i=0; i<km_num; i++){
-            //printf("");
-            //fprintf(stdout, "uint64: %"PRIu64, *(kms+i));
-            //fprintf(stdout, "\n");
-            int cov = kmer_cov(*(kms+i), mask, h);
-            //fprintf(stderr, "cov: %d\n", cov);
-            if(cov < min_cov){min_cov=cov;}
+static kms_stats_t __attribute__((unused)) kms_stats(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
+    kms_stats_t s;
+    s.max_cov = 0;
+    s.min_cov = LOW_COV_INIT;
+    s.ext_num = 0;
+    int sum_cov = 0;
+    for(int i = 0; i < km_num; i++){
+        int cov = kmer_cov(kms[i], mask, h);
+        if(cov > s.max_cov) s.max_cov = cov;
+        if(cov < s.min_cov) s.min_cov = cov;
+        if(cov > 0){ sum_cov += cov; s.ext_num++; }
     }
-    //printf("km_num: %d\n", km_num);
-    //printf("max cov: %d\n", max_cov);
-    return min_cov;
-}
-
-int kms_ext_num(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
-    int i, km_ex_num=0;
-    //fprintf(stdout, "func kms_max_cov\n");
-    for(i=0; i<km_num; i++){
-            //printf("");
-            //fprintf(stdout, "uint64: %"PRIu64, *(kms+i));
-            //fprintf(stdout, "\n");
-            int cov = kmer_cov(*(kms+i), mask, h);
-            //fprintf(stderr, "cov: %d\n", cov);
-            if(cov > 0){km_ex_num=km_ex_num + 1;}
-    }
-    //printf("km_num: %d\n", km_num);
-    //printf("max cov: %d\n", max_cov);
-    return km_ex_num;
-}
-
-int kms_avg_cov(uint64_t *kms, int km_num, uint64_t mask, kc_c4x_t *h){
-    int i, avg_cov=0, k_num=1;
-    //fprintf(stdout, "func kms_max_cov\n");
-    for(i=0; i<km_num; i++){
-            //printf("");
-            //fprintf(stdout, "uint64: %"PRIu64, *(kms+i));
-            //fprintf(stdout, "\n");
-            int cov = kmer_cov(*(kms+i), mask, h);
-            if(cov > 0){avg_cov = cov + avg_cov; k_num = k_num + 1;}
-    }
-    //printf("km_num: %d\n", km_num);
-    //printf("max cov: %d\n", max_cov);
-    if(k_num>0){
-        avg_cov = (int) avg_cov/k_num;
-    }else{
-        avg_cov=0;
-    }
-
-    return avg_cov;
+    s.avg_cov = (s.ext_num > 0) ? (sum_cov / s.ext_num) : 0;
+    return s;
 }
 
 
@@ -612,6 +443,13 @@ typedef struct {
     char type[10];
 } variation_t;
 
+typedef struct path_node {
+    struct path_node* pre_node;
+    uint64_t kmer;
+    unsigned int cov;
+    int pos;
+} path_node;
+
 // Add to evaluation_t struct
 typedef struct { // data structure for file evaluation
     kc_c4x_t *h;
@@ -631,18 +469,19 @@ typedef struct { // data structure for file evaluation
     FILE *vcf_out;
     int iteration;
     char *output_base;  // Add this field to store the output base name
+
+    // Path search arrays (moved from globals for thread safety and bounds checking)
+    path_node *all_nodes;
+    int all_nodes_capacity;
+    path_node **term_nodes;
+    path_node **good_term_nodes;
+    FILE *low_quality_fp;  // Moved from static for proper lifecycle management
+    int extent_recursion_depth;  // Moved from static for thread safety
 } evaluation_t;
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
 int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis);
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num);
-
-typedef struct path_node {
-    struct path_node* pre_node;
-    uint64_t kmer;
-    unsigned int cov;
-    int pos;
-} path_node;
 
 
 
@@ -895,9 +734,7 @@ unsigned char* kms_to_seq(unsigned char *aseq, uint64_t *kms, int start, int ter
     return aseq;
 }
 
-path_node all_nodes[Max_Path_Num * 2000];
-path_node *term_nodes[Max_Path_Num+1]; 
-path_node *good_term_nodes[Max_Path_Num+1]; 
+// Global arrays removed - now in evaluation_t struct for thread safety
 
 // 
 int slim_path(evaluation_t *eva, var_location *a_var, var_location *new_var, uint64_t *path_kms, int path_nodes_num){
@@ -960,8 +797,8 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     // int ref_pos_s = eva->var_locs[var_loc_p].pos_s;
     // int ref_pos_t = eva->var_locs[var_loc_p].pos_t;
 
-    path_node *p_node = good_term_nodes[path_index];
-    int path_nodes_num = path_node_num(good_term_nodes[path_index]);
+    path_node *p_node = eva->good_term_nodes[path_index];
+    int path_nodes_num = path_node_num(eva->good_term_nodes[path_index]);
     
     uint64_t *path_kms = nodes_to_kms(p_node, k);
     // uint64_t *slim_kms;
@@ -993,7 +830,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     
     // fprintf(stdout, "#Outputting the varation analysis results\n");
 
-    int path_cov = nodes_path_cov(eva, good_term_nodes[path_index]);
+    int path_cov = nodes_path_cov(eva, eva->good_term_nodes[path_index]);
 
     // fprintf(stdout, "##### nodes_path_cov() function finished\n");
 
@@ -1117,16 +954,16 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
     }
     
     // Initialize the first node
-    all_nodes[0].kmer = kmer_s;
-    all_nodes[0].cov = kmer_cov(min_hash_key(kmer_s, k), mask, h);
-    all_nodes[0].pre_node = NULL; // Ensure pre_node is initialized
+    eva->all_nodes[0].kmer = kmer_s;
+    eva->all_nodes[0].cov = kmer_cov(min_hash_key(kmer_s, k), mask, h);
+    eva->all_nodes[0].pre_node = NULL; // Ensure pre_node is initialized
     
     int a_cov = 1;
     if (a_cov < assem_min_cov) {
         a_cov = assem_min_cov;
     }
     
-    term_nodes[0] = &all_nodes[0];
+    eva->term_nodes[0] = &eva->all_nodes[0];
     
     int fresh_terms = 1, all_node_num = 1, p = 0;
     int good_term_node_num = 0;
@@ -1144,19 +981,13 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
     path_node *pre_term_nodes[Max_Path_Num+1]; 
 
     while(p <= max_path_len && fresh_terms > 0 && fresh_terms <= Max_Path_Num){
-        // fprintf(stdout, "Hello A\n");
         int i;
         //Copying old term nodes pointer
-        for(i=0; i < fresh_terms; i++){pre_term_nodes[i] = term_nodes[i]; }
-        //new_term_node_num = 0;
+        for(i=0; i < fresh_terms; i++){pre_term_nodes[i] = eva->term_nodes[i]; }
         int new_fresh_terms = 0;
         int n_p = 0;
         while(n_p < fresh_terms && new_fresh_terms <=Max_Path_Num ){
             p_node = pre_term_nodes[n_p]; //Obtain term node one by one
-            // fprintf(stdout, "Hello B\n");
-            // else{
-            //a_cov = p_node->cov/Max_Cov_Ratio;
-            //if(a_cov < cut_cov ){a_cov = cut_cov;}
             uint64_t kp = (*p_node).kmer<<2;
 
             next_nodes[0].kmer = kp & mask;
@@ -1168,31 +999,25 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
             next_nodes[2].cov = kmer_cov(min_hash_key(next_nodes[2].kmer, k),mask,h);
             next_nodes[3].cov = kmer_cov(min_hash_key(next_nodes[3].kmer, k),mask,h);
 
-            // fprintf(stdout, "cov: %d\t", next_nodes[0].cov);
-            // fprintf(stdout, "%d\t", next_nodes[1].cov);
-            // fprintf(stdout, "%d\t", next_nodes[2].cov);
-            // fprintf(stdout, "%d\n", next_nodes[3].cov);
-
             int i;
             for(i=0;i<4;i++){
-                // if(next_nodes[i].cov >=a_cov && next_nodes[i].cov <= b_cov){
-                // Check both min and max coverage limits (max limit only if > 0)
                 if(next_nodes[i].cov >=a_cov && (max_assem_cov <= 0 || next_nodes[i].cov <= max_assem_cov)){
-                    //print_uint64_kmer(next_nodes[i].kmer, k);
-                    //print_uint64_kmer(kmer_t, k);
-                    if( next_nodes[i].kmer == kmer_t){ // if the k-mer is equal to kmer_t, then 
-                      // skip this term node during path searching  
-                        all_nodes[all_node_num].pre_node = p_node;
-                        all_nodes[all_node_num].kmer = next_nodes[i].kmer;
-                        all_nodes[all_node_num].cov = next_nodes[i].cov;
-                        good_term_nodes[good_term_node_num] = &all_nodes[all_node_num];
+                    // Bounds check to prevent buffer overflow
+                    if(all_node_num >= eva->all_nodes_capacity) {
+                        fprintf(stderr, "Warning: Path search exceeded all_nodes capacity (%d)\n", eva->all_nodes_capacity);
+                        goto done;
+                    }
+                    if( next_nodes[i].kmer == kmer_t){ // if the k-mer is equal to kmer_t, then  
+                        eva->all_nodes[all_node_num].pre_node = p_node;
+                        eva->all_nodes[all_node_num].kmer = next_nodes[i].kmer;
+                        eva->all_nodes[all_node_num].cov = next_nodes[i].cov;
+                        eva->good_term_nodes[good_term_node_num] = &eva->all_nodes[all_node_num];
                         good_term_node_num++; 
                     }else{
-                        all_nodes[all_node_num].pre_node = p_node;
-                        all_nodes[all_node_num].kmer = next_nodes[i].kmer;
-                        all_nodes[all_node_num].cov = next_nodes[i].cov;
-                        term_nodes[new_fresh_terms] = &all_nodes[all_node_num];
-                        //new_term_node_num++;
+                        eva->all_nodes[all_node_num].pre_node = p_node;
+                        eva->all_nodes[all_node_num].kmer = next_nodes[i].kmer;
+                        eva->all_nodes[all_node_num].cov = next_nodes[i].cov;
+                        eva->term_nodes[new_fresh_terms] = &eva->all_nodes[all_node_num];
                         new_fresh_terms++; 
                     }
                     all_node_num++;
@@ -1203,9 +1028,9 @@ int var_path_search_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int 
         fresh_terms = new_fresh_terms;
         p++;
     }
+done:
     if(good_term_node_num == 1){
-        //good_term_nodes
-        if(path_node_num(good_term_nodes[good_term_node_num-1]) < k ){
+        if(path_node_num(eva->good_term_nodes[good_term_node_num-1]) < k ){
             good_term_node_num = 0;
         }
     }
@@ -1241,6 +1066,7 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
     ori_var.kmer_t = eva->var_locs[var_loc_p].kmer_t;
     ori_var.pos_s = eva->var_locs[var_loc_p].pos_s;
     ori_var.pos_t = eva->var_locs[var_loc_p].pos_t;
+    strncpy(ori_var.name, eva->var_locs[var_loc_p].name, sizeof(ori_var.name));
     
     // Add bounds checking
     if (ori_var.pos_s >= ori_var.pos_t) {
@@ -1290,55 +1116,53 @@ int var_analysis_ref(evaluation_t *eva, int var_loc_p, int max_path_len, int min
         }
         
         output_path(eva, var_loc_p, best_termnode_index);
-        
-        // if (good_term_node_num > 1) {
-        //     fprintf(stdout, "\tMultiple-path");
-        // }
-        // fprintf(stdout, "\n");
     }else{
-        // Output the location failed assembly to a separate file
-        static FILE *low_quality_fp = NULL;
-        static char low_quality_fn[256] = {0};
+        // Output the location failed assembly to low quality file
+        // (low_quality_fp is now in eva struct for proper lifecycle management)
         
         // Open the low quality zones file if it's not already open
-        if (low_quality_fp == NULL && eva->output_base != NULL) {
+        if (eva->low_quality_fp == NULL && eva->output_base != NULL) {
+            char low_quality_fn[256];
             snprintf(low_quality_fn, sizeof(low_quality_fn), "%s.low_quality_zones", eva->output_base);
-            low_quality_fp = fopen(low_quality_fn, "w");
-            if (!low_quality_fp) {
+            eva->low_quality_fp = fopen(low_quality_fn, "w");
+            if (!eva->low_quality_fp) {
                 fprintf(stderr, "Error: Could not open low quality zones file %s\n", low_quality_fn);
                 return 0;
             }
             // Write header
-            fprintf(low_quality_fp, "#CHROM\tSTART\tEND\tLENGTH\tITERATION\n");
+            fprintf(eva->low_quality_fp, "#CHROM\tSTART\tEND\tLENGTH\tITERATION\n");
         }
         
-        if (low_quality_fp) {
-            // Write location information to the file
-            fprintf(low_quality_fp, "%s\t%d\t%d\t%d\t%d\n", 
-                    eva->var_locs[var_loc_p].name,
-                    eva->var_locs[var_loc_p].pos_s + eva->k + 1,  // Convert to 1-based genomic position
-                    eva->var_locs[var_loc_p].pos_t + eva->k,      // End position
-                    eva->var_locs[var_loc_p].pos_t - eva->var_locs[var_loc_p].pos_s,  // Length
+        if (eva->low_quality_fp) {
+            // Write location information using original positions
+            fprintf(eva->low_quality_fp, "%s\t%d\t%d\t%d\t%d\n", 
+                    ori_var.name,
+                    ori_var.pos_s + eva->k + 1,  // Convert to 1-based genomic position
+                    ori_var.pos_t + eva->k,      // End position
+                    ori_var.pos_t - ori_var.pos_s,  // Length
                     eva->iteration);  // Current iteration
             
             // Flush the file to ensure data is written
-            fflush(low_quality_fp);
+            fflush(eva->low_quality_fp);
         }
     }
+
+    // Restore original var_locs state after extension may have modified it
+    eva->var_locs[var_loc_p] = ori_var;
 
     return good_term_node_num;
 }
 
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num){
     debug_print("\n ###best_term_node() \n");
-    int i = 0, best_path=0, short_path_var_len = 10000, short_path_cov = 1;
+    int i = 0, best_path=0, short_path_var_len = LOW_COV_INIT, short_path_cov = 1;
     int p_path_node_num, var_len=0, p_path_cov;
 
     for(i=0; i < good_term_node_num; i++){
-        p_path_node_num = path_node_num(good_term_nodes[i]);
+        p_path_node_num = path_node_num(eva->good_term_nodes[i]);
         var_len = abs(p_path_node_num -ref_node_num) ;
-        p_path_cov = nodes_path_cov(eva, good_term_nodes[i]);
-        if(var_len < short_path_var_len || (p_path_node_num == short_path_var_len && p_path_cov > short_path_cov)){
+        p_path_cov = nodes_path_cov(eva, eva->good_term_nodes[i]);
+        if(var_len < short_path_var_len || (var_len == short_path_var_len && p_path_cov > short_path_cov)){
             best_path = i;
             short_path_var_len = var_len;
             short_path_cov = p_path_cov;
@@ -1391,7 +1215,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     
     itt = 0;
     // We need to limit how far we can extend to avoid going out of bounds
-    int max_extension = 1000; // Arbitrary limit
+    int max_extension = MAX_EXTENT_DISTANCE;
     while (cov_t <= assem_min_cov && itt < dis && itt < max_extension) {
         var_loc->pos_t = var_loc->pos_t + 1;
         cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
@@ -1406,11 +1230,10 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     int cov_tt = kmer_cov(min_hash_key(var_loc->kmer_t, k), mask, eva->hr);
     
     // Limit recursion depth to prevent stack overflow
-    static int recursion_depth = 0;
-    if ((cov_rr > 1 || cov_tt > 1) && recursion_depth < 5) {
-        recursion_depth++;
+    if ((cov_rr > 1 || cov_tt > 1) && eva->extent_recursion_depth < MAX_EXTENT_RECURSION) {
+        eva->extent_recursion_depth++;
         extent_var_loc(eva, kms, var_loc, assem_min_cov, dis);
-        recursion_depth--;
+        eva->extent_recursion_depth--;
     }
     
     return 1;
@@ -1505,7 +1328,7 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
                     int rep_km_num = kmer_cov(min_hash_key(kms[j],k), mask, eva->hr); 
                     int s_km_cov = kmer_cov(min_hash_key(one_var_loc.kmer_s,k), mask, eva->h);
                     
-                    if(rep_km_num < 100 && s_km_cov/cov <= 100) {
+                    if(rep_km_num < MAX_REP_KM_NUM && (cov > 0 && s_km_cov/cov <= MAX_COV_RATIO)) {
                         var_locs[var_loc_num].kmer_s = one_var_loc.kmer_s;
                         var_locs[var_loc_num].pos_s = one_var_loc.pos_s;
                         var_locs[var_loc_num].kmer_t = kms[j];
@@ -1817,6 +1640,7 @@ int main(int argc, char *argv[])
     hr = count_file(argv[o.ind], k, p, block_size, n_thread);
 
     evaluation_t eva;
+    memset(&eva, 0, sizeof(eva));  // Zero-initialize all fields
     eva.h = h;
     eva.hr = hr;
     eva.k = k;
@@ -1828,6 +1652,14 @@ int main(int argc, char *argv[])
     eva.var_capacity = 0;
     eva.variations = NULL;
     eva.output_base = output_base;  // Set the output_base in the eva struct
+
+    // Allocate path search arrays (moved from globals)
+    eva.all_nodes_capacity = MAX_ALL_NODES;
+    MALLOC(eva.all_nodes, eva.all_nodes_capacity);
+    MALLOC(eva.term_nodes, Max_Path_Num + 1);
+    MALLOC(eva.good_term_nodes, Max_Path_Num + 1);
+    eva.low_quality_fp = NULL;
+    eva.extent_recursion_depth = 0;
 
     char *current_ref = argv[o.ind];
     for (int iter = 1; iter <= num_iters; iter++) {
@@ -1912,6 +1744,29 @@ int main(int argc, char *argv[])
         }
         free(hr->h);
         free(hr);
+    }
+
+    // Final cleanup
+    if (eva.low_quality_fp) {
+        fclose(eva.low_quality_fp);
+        eva.low_quality_fp = NULL;
+    }
+    free(eva.all_nodes);
+    free(eva.term_nodes);
+    free(eva.good_term_nodes);
+    if (eva.variations != NULL) {
+        free(eva.variations);
+    }
+    // Free NGS k-mer hash
+    for (int i = 0; i < (1<<p); i++) {
+        kc_c4_destroy(h->h[i]);
+    }
+    free(h->h);
+    free(h);
+    // Note: initial hr is freed inside the loop on first iteration (eva.hr = hr)
+    // Free current_ref if it was allocated
+    if (current_ref != argv[o.ind]) {
+        free(current_ref);
     }
 
     return 0;

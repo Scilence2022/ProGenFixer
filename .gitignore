@@ -4,3 +4,4 @@ ProGenFixer
 *.c.bak
 *.bak
 *.pdf
+*.dSYM/
