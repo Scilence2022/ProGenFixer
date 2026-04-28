@@ -1714,6 +1714,7 @@ int main(int argc, char *argv[])
     int max_assem_cov = 0; // Default: no max coverage limit
     int backfill_enabled = 1; // Back-fill of unique NGS k-mers enabled by default
     int backfill_max_ext = 0; // 0 => use insert_size
+    int backfill_min_cov_override = 0; // 0 => use -a value
     char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
@@ -1722,6 +1723,7 @@ int main(int argc, char *argv[])
         { "fix", ko_optional_argument, 128 },
         { "no-backfill", ko_no_argument, 129 },
         { "backfill-len", ko_required_argument, 130 },
+        { "backfill-min-cov", ko_required_argument, 131 },
         { 0, 0, 0 }
     };
     
@@ -1742,6 +1744,9 @@ int main(int argc, char *argv[])
         }
         else if (c == 130) {
             backfill_max_ext = atoi(o.arg);
+        }
+        else if (c == 131) {
+            backfill_min_cov_override = atoi(o.arg);
         }
         else if (c == 'o') output_base = o.arg;
     }
@@ -1820,7 +1825,7 @@ int main(int argc, char *argv[])
 
     // Back-fill state
     eva.used_kmers = u64set_init();
-    eva.backfill_min_cov = assem_min_cov;
+    eva.backfill_min_cov = backfill_min_cov_override > 0 ? backfill_min_cov_override : assem_min_cov;
     eva.backfill_max_ext = backfill_max_ext > 0 ? backfill_max_ext : insert_size;
 
     char *current_ref = argv[o.ind];
@@ -1973,6 +1978,7 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "  --no-backfill       disable back-fill of NGS-unique k-mers\n");
     fprintf(stderr, "  --backfill-len INT  max extension length per side for back-fill [uses -l]\n");
+    fprintf(stderr, "  --backfill-min-cov INT  min NGS k-mer coverage for back-fill [uses -a]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
