@@ -64,6 +64,70 @@ static inline void u64set_add(u64set_t *s, uint64_t key) {
     u64set_put(s, key, &absent);
 }
 
+// ---------------------------------------------------------------------------
+// u64 -> u64 hash map used by the back-fill phase to resolve reference
+// positions for anchor k-mers, so that novel back-fill sequences can be
+// emitted as proper VCF records.
+//
+// Packed value layout for a reference-kmer position (64 bits):
+//   bit 63       : ambiguity flag. Set when the same canonical k-mer was
+//                  inserted more than once during indexing (repeat / palindrome).
+//                  Consumers must treat such entries as unresolved.
+//   bits 62..33  : contig index (30-bit unsigned).
+//   bit 32       : strand flag of the *first* insertion: 0 = forward k-mer
+//                  at that position equals the canonical form;
+//                  1 = reverse complement of k-mer at that position equals
+//                  the canonical form.
+//   bits 31..0   : 1-based position of the k-mer's leftmost base on the
+//                  forward strand of the contig.
+// ---------------------------------------------------------------------------
+#define u64map_hashfn(x) u64_hashfn(x)
+#define u64map_equalfn(a, b) u64_equalfn(a, b)
+KHASHL_MAP_INIT(, u64map_t, u64map, uint64_t, uint64_t, u64map_hashfn, u64map_equalfn)
+
+#define REFPOS_AMBIG_BIT   (1ULL << 63)
+#define REFPOS_STRAND_BIT  (1ULL << 32)
+#define REFPOS_POS_MASK    ((1ULL << 32) - 1ULL)
+#define REFPOS_CIDX_SHIFT  33
+#define REFPOS_CIDX_MASK   ((1ULL << 30) - 1ULL)
+
+static inline uint64_t refpos_encode(int contig_idx, uint32_t pos, int strand) {
+    return (((uint64_t)((uint32_t)contig_idx & REFPOS_CIDX_MASK)) << REFPOS_CIDX_SHIFT)
+         | (strand ? REFPOS_STRAND_BIT : 0ULL)
+         | ((uint64_t)pos & REFPOS_POS_MASK);
+}
+
+static inline void refpos_decode(uint64_t v, int *contig_idx, uint32_t *pos, int *strand) {
+    if (contig_idx) *contig_idx = (int)((v >> REFPOS_CIDX_SHIFT) & REFPOS_CIDX_MASK);
+    if (strand)     *strand     = (v & REFPOS_STRAND_BIT) ? 1 : 0;
+    if (pos)        *pos        = (uint32_t)(v & REFPOS_POS_MASK);
+}
+
+// Insert the first occurrence of a canonical k-mer, or mark an existing
+// entry as ambiguous if the canonical k-mer is encountered again.
+static inline void u64map_refpos_upsert(u64map_t *m, uint64_t can, uint64_t packed) {
+    if (m == NULL) return;
+    int absent;
+    khint_t it = u64map_put(m, can, &absent);
+    if (absent) {
+        kh_val(m, it) = packed;
+    } else {
+        kh_val(m, it) = kh_val(m, it) | REFPOS_AMBIG_BIT;
+    }
+}
+
+// Returns: 1 if unique (outputs populated), 0 if not present, -1 if ambiguous.
+static inline int u64map_refpos_lookup(u64map_t *m, uint64_t can,
+                                       int *contig_idx, uint32_t *pos, int *strand) {
+    if (m == NULL) return 0;
+    khint_t it = u64map_get(m, can);
+    if (it == kh_end(m)) return 0;
+    uint64_t v = kh_val(m, it);
+    if (v & REFPOS_AMBIG_BIT) return -1;
+    refpos_decode(v, contig_idx, pos, strand);
+    return 1;
+}
+
 #define CALLOC(ptr, len) do { \
     (ptr) = (__typeof__(ptr))calloc((len), sizeof(*(ptr))); \
     if ((ptr) == NULL) { fprintf(stderr, "Error: calloc failed at %s:%d\n", __FILE__, __LINE__); exit(1); } \
@@ -489,6 +553,7 @@ typedef struct { // data structure for file evaluation
     int n_backfill_novel;    // stats: novel paths found this iteration
     int n_backfill_contam;   // stats: contamination k-mers this iteration
     int n_backfill_unique;   // stats: total NGS-unique k-mers considered
+    int n_backfill_vcf;      // stats: novel paths successfully emitted as VCF records
 } evaluation_t;
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
@@ -496,7 +561,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num);
 
 // Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
-static void backfill_unique_kmers(evaluation_t *eva);
+static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path);
 
 
 
@@ -795,7 +860,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
         fprintf(eva->vcf_out, ".\t"); // QUAL
         fprintf(eva->vcf_out, "PASS\t"); // FILTER
         if(slim_path_len > ref_seq_len){strcpy(var_type, "INS"); }else{strcpy(var_type, "SUB"); }
-        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s;SOURCE=VARCALL", path_cov, var_type);
         fprintf(eva->vcf_out, "%s", info_field);
 
     }
@@ -814,7 +879,7 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
         fprintf(eva->vcf_out, ".\t"); // QUAL
         fprintf(eva->vcf_out, "PASS\t"); // FILTER
         strcpy(var_type, "DEL");
-        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s;SOURCE=VARCALL", path_cov, var_type);
         fprintf(eva->vcf_out, "%s", info_field);
     }
     fprintf(eva->vcf_out, "\n");
@@ -1487,6 +1552,210 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
 
 
 // ===================================================================
+// Reference-position index used to translate back-fill anchor k-mers into
+// VCF CHROM/POS/REF. Built once at the start of each back-fill invocation
+// by re-reading the current reference FASTA.
+// ===================================================================
+typedef struct {
+    u64map_t *kpos;              // canonical k-mer -> encoded (contig,pos,strand) or ambiguous
+    char **contig_names;         // contig display names (NUL-terminated)
+    unsigned char **contig_seqs; // contig sequences, uppercase ACGT/N, 0-based
+    uint32_t *contig_lens;       // sequence lengths
+    int n_contigs;
+    int k;
+} ref_pos_ctx_t;
+
+static void ref_pos_ctx_free(ref_pos_ctx_t *ctx) {
+    if (ctx == NULL) return;
+    if (ctx->kpos) u64map_destroy(ctx->kpos);
+    if (ctx->contig_names) {
+        for (int i = 0; i < ctx->n_contigs; i++) free(ctx->contig_names[i]);
+        free(ctx->contig_names);
+    }
+    if (ctx->contig_seqs) {
+        for (int i = 0; i < ctx->n_contigs; i++) free(ctx->contig_seqs[i]);
+        free(ctx->contig_seqs);
+    }
+    if (ctx->contig_lens) free(ctx->contig_lens);
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+// Re-read the reference FASTA and build a canonical-kmer -> position map
+// plus per-contig sequence copies. Returns 0 on success, -1 on failure.
+static int ref_pos_ctx_build(const char *path, int k, ref_pos_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->k = k;
+    gzFile fp = gzopen(path, "r");
+    if (fp == NULL) return -1;
+    kseq_t *seq = kseq_init(fp);
+    ctx->kpos = u64map_init();
+    if (ctx->kpos == NULL) { kseq_destroy(seq); gzclose(fp); return -1; }
+
+    int cap = 0;
+    int l;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    while ((l = kseq_read(seq)) >= 0) {
+        if (l < k) continue;
+        if (ctx->n_contigs >= cap) {
+            cap = cap ? cap * 2 : 16;
+            char **nn = realloc(ctx->contig_names, (size_t)cap * sizeof(char *));
+            unsigned char **ns = realloc(ctx->contig_seqs, (size_t)cap * sizeof(unsigned char *));
+            uint32_t *nl = realloc(ctx->contig_lens, (size_t)cap * sizeof(uint32_t));
+            if (!nn || !ns || !nl) {
+                free(nn); free(ns); free(nl);
+                kseq_destroy(seq); gzclose(fp);
+                ref_pos_ctx_free(ctx);
+                return -1;
+            }
+            ctx->contig_names = nn;
+            ctx->contig_seqs  = ns;
+            ctx->contig_lens  = nl;
+        }
+        int cidx = ctx->n_contigs++;
+        ctx->contig_names[cidx] = strdup(seq->name.s ? seq->name.s : "");
+        ctx->contig_lens[cidx]  = (uint32_t)l;
+        unsigned char *s = malloc((size_t)l + 1);
+        if (s == NULL) { kseq_destroy(seq); gzclose(fp); ref_pos_ctx_free(ctx); return -1; }
+        for (int i = 0; i < l; i++) {
+            unsigned char c = (unsigned char)seq->seq.s[i];
+            if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            s[i] = c;
+        }
+        s[l] = '\0';
+        ctx->contig_seqs[cidx] = s;
+
+        // Slide a k-mer window across the contig and index canonical forms.
+        uint64_t y = 0;
+        int len = 0;
+        for (int i = 0; i < l; i++) {
+            int c = seq_nt4_table[s[i]];
+            if (c >= 4) { y = 0; len = 0; continue; }
+            y = ((y << 2) | (uint64_t)c) & mask;
+            if (++len >= k) {
+                uint32_t pos = (uint32_t)(i - k + 2); // 1-based leftmost base
+                uint64_t can = min_hash_key(y, k);
+                int strand = (y == can) ? 0 : 1;
+                u64map_refpos_upsert(ctx->kpos, can, refpos_encode(cidx, pos, strand));
+            }
+        }
+    }
+    kseq_destroy(seq);
+    gzclose(fp);
+    return 0;
+}
+
+// Encode a uint64 k-mer (forward) into its ACGT string representation.
+// Returns seq (already null-terminated by the caller if needed).
+static inline void kmer_to_acgt(uint64_t y, int k, unsigned char *out) {
+    uint64_acgt(y, out, (unsigned char)k);
+}
+
+// Reverse-complement an ACGT string in place.
+static inline void acgt_revcomp_inplace(unsigned char *s, int n) {
+    static const unsigned char cmp[128] = {
+        ['A']='T', ['C']='G', ['G']='C', ['T']='A', ['N']='N',
+        ['a']='t', ['c']='g', ['g']='c', ['t']='a', ['n']='n'
+    };
+    for (int i = 0, j = n - 1; i < j; i++, j--) {
+        unsigned char a = s[i], b = s[j];
+        s[i] = cmp[b] ? cmp[b] : 'N';
+        s[j] = cmp[a] ? cmp[a] : 'N';
+    }
+    if ((n & 1) == 1) {
+        int m = n / 2;
+        s[m] = cmp[s[m]] ? cmp[s[m]] : 'N';
+    }
+}
+
+// Emit one back-fill novel sequence as a VCF record (SOURCE=BACKFILL) when
+// both anchors resolve uniquely onto the same contig with consistent strand.
+// Returns 1 if a record was written, 0 otherwise.
+//   left_anchor_can / right_anchor_can : canonical forms of the two anchors.
+//   left_walk_fwd / right_walk_fwd     : fwd encodings (walk orientation) of
+//                                        left_path[lpl-1] and right_path[rpl-1].
+//   assembled_seq  : NUL-terminated ACGT string, length == seq_len == k+lpl+rpl.
+static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
+                             uint64_t left_anchor_can, uint64_t left_walk_fwd,
+                             uint64_t right_anchor_can, uint64_t right_walk_fwd,
+                             const unsigned char *assembled_seq, int seq_len,
+                             int path_cov)
+{
+    if (eva == NULL || eva->vcf_out == NULL || ctx == NULL || ctx->kpos == NULL) return 0;
+    int k = eva->k;
+
+    int l_cidx = 0, r_cidx = 0, l_strand = 0, r_strand = 0;
+    uint32_t l_pos = 0, r_pos = 0;
+    int l_ok = u64map_refpos_lookup(ctx->kpos, left_anchor_can, &l_cidx, &l_pos, &l_strand);
+    int r_ok = u64map_refpos_lookup(ctx->kpos, right_anchor_can, &r_cidx, &r_pos, &r_strand);
+    if (l_ok != 1 || r_ok != 1) return 0;           // unknown or ambiguous
+    if (l_cidx != r_cidx) return 0;                  // anchors on different contigs
+    if (left_anchor_can == right_anchor_can) return 0; // self-loop / palindrome
+
+    // Determine whether the walk orientation matches the reference forward strand.
+    // For the left anchor: walk_matches_ref_fwd <=> (left_walk_fwd == left_anchor_can) XOR (l_strand == 1) == 0.
+    int left_walk_is_can  = (left_walk_fwd  == left_anchor_can);
+    int right_walk_is_can = (right_walk_fwd == right_anchor_can);
+    int l_walk_on_fwd = (left_walk_is_can  ? (l_strand == 0) : (l_strand == 1));
+    int r_walk_on_fwd = (right_walk_is_can ? (r_strand == 0) : (r_strand == 1));
+    if (l_walk_on_fwd != r_walk_on_fwd) return 0;   // inconsistent strand
+
+    int on_fwd = l_walk_on_fwd;
+    uint32_t L_pos, R_pos;
+    if (on_fwd) { L_pos = l_pos; R_pos = r_pos; }
+    else        { L_pos = r_pos; R_pos = l_pos; }
+    if (R_pos <= L_pos) return 0;                   // inconsistent ordering
+
+    // Reference span [L_pos .. R_pos + k - 1] (1-based inclusive).
+    uint32_t contig_len = ctx->contig_lens[l_cidx];
+    if (R_pos + (uint32_t)k - 1 > contig_len) return 0;
+    int ref_span = (int)(R_pos - L_pos) + k;
+    if (ref_span != seq_len) return 0;              // length mismatch (defensive)
+
+    // Build REF and ALT strings.
+    unsigned char *REF = malloc((size_t)ref_span + 1);
+    unsigned char *ALT = malloc((size_t)seq_len + 1);
+    if (REF == NULL || ALT == NULL) { free(REF); free(ALT); return 0; }
+    memcpy(REF, ctx->contig_seqs[l_cidx] + (L_pos - 1), (size_t)ref_span);
+    REF[ref_span] = '\0';
+    memcpy(ALT, assembled_seq, (size_t)seq_len);
+    ALT[seq_len] = '\0';
+    if (!on_fwd) acgt_revcomp_inplace(ALT, seq_len);
+
+    // Sanity: first k chars of ALT must equal ref[L_pos..L_pos+k-1], and
+    // last k chars of ALT must equal ref[R_pos..R_pos+k-1]. Skip on mismatch.
+    if (memcmp(REF, ALT, (size_t)k) != 0 ||
+        memcmp(REF + ref_span - k, ALT + seq_len - k, (size_t)k) != 0) {
+        free(REF); free(ALT); return 0;
+    }
+
+    // Normalize: trim common suffix then common prefix, retaining >=1 base in both.
+    int r_len = ref_span;
+    int a_len = seq_len;
+    int head  = 0;
+    while (r_len > 1 && a_len > 1 && REF[r_len - 1] == ALT[a_len - 1]) { r_len--; a_len--; }
+    while (r_len > 1 && a_len > 1 && REF[head] == ALT[head])          { r_len--; a_len--; head++; }
+
+    if (r_len == a_len && r_len == 0) { free(REF); free(ALT); return 0; }
+    uint32_t vcf_pos = L_pos + (uint32_t)head;
+
+    const char *var_type = "SUB";
+    if (a_len > r_len)      var_type = "INS";
+    else if (a_len < r_len) var_type = "DEL";
+
+    // Emit VCF record.
+    fprintf(eva->vcf_out, "%s\t%u\t.\t", ctx->contig_names[l_cidx], vcf_pos);
+    fwrite(REF + head, 1, (size_t)r_len, eva->vcf_out);
+    fprintf(eva->vcf_out, "\t");
+    fwrite(ALT + head, 1, (size_t)a_len, eva->vcf_out);
+    fprintf(eva->vcf_out, "\t.\tPASS\tKMER_COV=%d;VARTYPE=%s;SOURCE=BACKFILL\n",
+            path_cov, var_type);
+
+    free(REF);
+    free(ALT);
+    return 1;
+}
+
+// ===================================================================
 // Back-fill process: recover variation signals that the reference-anchored
 // variant caller did not consume. The set of candidate starting k-mers is
 // the intersection of three conditions:
@@ -1577,7 +1846,7 @@ static int backfill_extend(evaluation_t *eva, uint64_t start_fwd, int direction,
     return 0; // reached max length without anchor
 }
 
-static void backfill_unique_kmers(evaluation_t *eva)
+static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path)
 {
     if (eva == NULL || eva->h == NULL || eva->hr == NULL || eva->output_base == NULL) {
         return;
@@ -1589,6 +1858,22 @@ static void backfill_unique_kmers(evaluation_t *eva)
     uint64_t mask = (1ULL << (k * 2)) - 1;
     int min_cov = eva->backfill_min_cov > 0 ? eva->backfill_min_cov : 2;
     int max_ext = eva->backfill_max_ext > 0 ? eva->backfill_max_ext : 1000;
+
+    // Build a reference canonical-kmer -> position index so that novel
+    // back-fill sequences can be emitted as VCF records tagged SOURCE=BACKFILL.
+    // If the build fails, back-fill still proceeds but VCF emission is skipped.
+    ref_pos_ctx_t rpctx;
+    int rp_ok = 0;
+    if (ref_path != NULL && eva->vcf_out != NULL) {
+        if (ref_pos_ctx_build(ref_path, k, &rpctx) == 0) {
+            rp_ok = 1;
+        } else {
+            fprintf(stderr,
+                    "Warning: back-fill could not build reference position index from %s; "
+                    "VCF records for BACKFILL variants will be suppressed this iteration.\n",
+                    ref_path);
+        }
+    }
 
     char novel_fn[512], contam_fn[512];
     snprintf(novel_fn, sizeof(novel_fn), "%s.iter%d.novel.tsv",
@@ -1614,6 +1899,7 @@ static void backfill_unique_kmers(evaluation_t *eva)
     eva->n_backfill_novel = 0;
     eva->n_backfill_contam = 0;
     eva->n_backfill_unique = 0;
+    eva->n_backfill_vcf = 0;
 
     // Iterate every NGS k-mer bucket.
     for (int bi = 0; bi < (1 << p); bi++) {
@@ -1705,6 +1991,19 @@ static void backfill_unique_kmers(evaluation_t *eva)
                 fprintf(novel_fp, "%s\t%s\t%d\t%d\t%s\n",
                         la_seq, ra_seq, seq_len, cov, seq_buf);
 
+                // Also emit a VCF record tagged SOURCE=BACKFILL when both
+                // anchors resolve uniquely on the same reference contig.
+                if (rp_ok && lpl > 0 && rpl > 0) {
+                    uint64_t left_walk_fwd  = left_path[lpl - 1];
+                    uint64_t right_walk_fwd = right_path[rpl - 1];
+                    int emitted = emit_backfill_vcf(
+                        eva, &rpctx,
+                        left_anchor, left_walk_fwd,
+                        right_anchor, right_walk_fwd,
+                        seq_buf, seq_len, cov);
+                    if (emitted) eva->n_backfill_vcf++;
+                }
+
                 // Mark every canonical k-mer along the accepted path as used.
                 u64set_add(eva->used_kmers, y_can);
                 for (int ii = 0; ii < lpl; ii++) {
@@ -1742,10 +2041,12 @@ static void backfill_unique_kmers(evaluation_t *eva)
     free(right_path);
     fclose(novel_fp);
     fclose(contam_fp);
+    if (rp_ok) ref_pos_ctx_free(&rpctx);
     fprintf(stderr,
-            "Back-fill (iter %d): unique-NGS=%d, novel=%d, contamination=%d\n",
+            "Back-fill (iter %d): unique-NGS=%d, novel=%d, contamination=%d, vcf-emitted=%d\n",
             eva->iteration, eva->n_backfill_unique,
-            eva->n_backfill_novel, eva->n_backfill_contam);
+            eva->n_backfill_novel, eva->n_backfill_contam,
+            eva->n_backfill_vcf);
 }
 
 // Fix memory management in main iteration loop
@@ -1893,6 +2194,7 @@ int main(int argc, char *argv[])
 
         fprintf(vcf_fp, "##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description=\"K-mer coverage of the variant path\">\n");
         fprintf(vcf_fp, "##INFO=<ID=VARTYPE,Number=1,Type=String,Description=\"Variant type (INS, DEL, SUB)\">\n");
+        fprintf(vcf_fp, "##INFO=<ID=SOURCE,Number=1,Type=String,Description=\"Origin of the variant call: VARCALL (reference-anchored variant calling with path assembly) or BACKFILL (recovered from NGS-unique k-mers via greedy De Bruijn graph walk with two-sided reference anchoring)\">\n");
         fprintf(vcf_fp, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
 
         // Count current reference k-mers
@@ -1936,13 +2238,15 @@ int main(int argc, char *argv[])
         // Run analysis
         fprintf(stderr, "Running analysis for iteration %d...\n", iter);
         analysis_ref_seq(&eva, current_ref, insert_size, min_cov, assem_min_cov);
-        fclose(vcf_fp);
 
         // Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
+        // Must run BEFORE closing vcf_fp because back-fill emits its own VCF
+        // records (tagged SOURCE=BACKFILL) into the same file.
         if (backfill_enabled) {
             fprintf(stderr, "Running back-fill for iteration %d...\n", iter);
-            backfill_unique_kmers(&eva);
+            backfill_unique_kmers(&eva, current_ref);
         }
+        fclose(vcf_fp);
 
         // Apply corrections if we found any variations
         if (eva.var_count > 0) {
