@@ -5,3 +5,5 @@ ProGenFixer
 *.bak
 *.pdf
 *.dSYM/
+.qoder/
+backfill_analysis_report.md

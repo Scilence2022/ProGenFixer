@@ -2131,7 +2131,7 @@ int main(int argc, char *argv[])
     
     int c_f_n = 2;
     while(c_f_n < f_num ) {
-        fprintf(stderr, "Counting NGS file %d ......\n", c_f_n );
+        fprintf(stderr, "Counting k-mers of NGS file %d ......\n", c_f_n );
         h = count_file2(argv[o.ind + c_f_n ], h, k, p, block_size, n_thread);  
         c_f_n = c_f_n + 1;
     }
