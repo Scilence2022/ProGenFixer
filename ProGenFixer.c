@@ -592,17 +592,26 @@ static int record_variation(evaluation_t *eva, const char *chrom, int pos,
 {
     if (eva == NULL || chrom == NULL || ref == NULL || alt == NULL || type == NULL) return 0;
     if (pos <= 0) return 0;
+    size_t span_len = ref_len > 0 ? ref_len : 1;
+    if ((size_t)pos > (size_t)INT_MAX - span_len + 1) return 0;
+    int end = pos + (int)span_len - 1;
 
     for (int i = 0; i < eva->var_count; i++) {
         variation_t *old = &eva->variations[i];
         if (old->chrom == NULL || old->ref == NULL || old->alt == NULL) continue;
+        if (strcmp(old->chrom, chrom) != 0) continue;
         if (old->pos == pos &&
-            strcmp(old->chrom, chrom) == 0 &&
             strcmp(old->type, type) == 0 &&
             strlen(old->ref) == ref_len &&
             strlen(old->alt) == alt_len &&
             memcmp(old->ref, ref, ref_len) == 0 &&
             memcmp(old->alt, alt, alt_len) == 0) {
+            return 0;
+        }
+        size_t old_span_len = strlen(old->ref);
+        if (old_span_len == 0) old_span_len = 1;
+        int old_end = old->pos + (int)old_span_len - 1;
+        if (pos <= old_end && old->pos <= end) {
             return 0;
         }
     }
