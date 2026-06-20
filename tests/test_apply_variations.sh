@@ -35,6 +35,7 @@ int main(int argc, char **argv)
     FILE *fp = fopen(ref_path, "w");
     if (!fp) return 3;
     fprintf(fp, ">%s\\nAACCGGTT\\n", long_name);
+    fprintf(fp, ">overlap\\nAAAACCCCGGGGTTTT\\n");
     fprintf(fp, ">big\\n");
     write_repeat(fp, 'A', 1100);
     fprintf(fp, "TT\\n");
@@ -52,6 +53,8 @@ int main(int argc, char **argv)
 
     record_variation(&eva, long_name, 3, "C", 1, "T", 1, "SUB");
     record_variation(&eva, long_name, 3, "C", 1, "T", 1, "SUB");
+    record_variation(&eva, "overlap", 5, "CCCCGGGG", 8, "C", 1, "DEL");
+    record_variation(&eva, "overlap", 8, "CGGGG", 5, "", 0, "DEL");
 
     char *big_ref = malloc(1101);
     char *big_alt = malloc(1103);
@@ -104,6 +107,7 @@ if name is not None:
 
 long_name = "L" * 179
 assert records[long_name] == "AATCGGTT", records.get(long_name)
+assert records["overlap"] == "AAAACTTTT", records["overlap"]
 assert records["big"] == ("A" * 1100) + "CCTT", len(records["big"])
 PY
 
