@@ -6,6 +6,8 @@
 #include <time.h> 
 #include <math.h>
 #include <unistd.h>
+#include <limits.h>
+#include <string.h>
 
 #include "ketopt.h" // command-line argument parser
 #include "kthread.h" // multi-threading models: pipeline and multi-threaded for loop
@@ -496,10 +498,10 @@ typedef struct {
 
 // Add new struct for variations
 typedef struct {
-    char chrom[100];
+    char *chrom;
     int pos;
-    char ref[1000];
-    char alt[1000];
+    char *ref;
+    char *alt;
     char type[10];
 } variation_t;
 
@@ -556,6 +558,55 @@ typedef struct { // data structure for file evaluation
     int n_backfill_unique;   // stats: total NGS-unique k-mers considered
     int n_backfill_vcf;      // stats: novel paths successfully emitted as VCF records
 } evaluation_t;
+
+static char *pgf_strndup(const char *src, size_t len)
+{
+    char *dst = malloc(len + 1);
+    if (dst == NULL) {
+        fprintf(stderr, "Error: malloc failed at %s:%d\n", __FILE__, __LINE__);
+        exit(1);
+    }
+    if (len > 0) memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static void free_variations(evaluation_t *eva)
+{
+    if (eva == NULL || eva->variations == NULL) return;
+    for (int i = 0; i < eva->var_count; i++) {
+        free(eva->variations[i].chrom);
+        free(eva->variations[i].ref);
+        free(eva->variations[i].alt);
+    }
+    free(eva->variations);
+    eva->variations = NULL;
+    eva->var_count = 0;
+    eva->var_capacity = 0;
+}
+
+static void record_variation(evaluation_t *eva, const char *chrom, int pos,
+                             const char *ref, size_t ref_len,
+                             const char *alt, size_t alt_len,
+                             const char *type)
+{
+    if (eva == NULL || chrom == NULL || ref == NULL || alt == NULL || type == NULL) return;
+    if (pos <= 0) return;
+
+    if (eva->var_count >= eva->var_capacity) {
+        eva->var_capacity = eva->var_capacity ? eva->var_capacity * 2 : 10;
+        REALLOC(eva->variations, eva->var_capacity);
+    }
+
+    variation_t *var = &eva->variations[eva->var_count++];
+    memset(var, 0, sizeof(*var));
+    var->chrom = pgf_strndup(chrom, strlen(chrom));
+    var->pos = pos;
+    var->ref = pgf_strndup(ref, ref_len);
+    var->alt = pgf_strndup(alt, alt_len);
+    strncpy(var->type, type, sizeof(var->type) - 1);
+    var->type[sizeof(var->type) - 1] = '\0';
+}
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
 int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis);
@@ -662,7 +713,13 @@ static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 int compare_variations(const void *a, const void *b) {
     const variation_t *va = (const variation_t *)a;
     const variation_t *vb = (const variation_t *)b;
-    return vb->pos - va->pos; // Sort descending by position
+    const char *ca = va->chrom ? va->chrom : "";
+    const char *cb = vb->chrom ? vb->chrom : "";
+    int chrom_cmp = strcmp(ca, cb);
+    if (chrom_cmp != 0) return chrom_cmp;
+    if (vb->pos > va->pos) return 1;
+    if (vb->pos < va->pos) return -1;
+    return 0;
 }
 
 int path_node_num(path_node *term_node){
@@ -891,30 +948,15 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     // fprintf(stdout, " new_var term_pos: %d \n\n\n\n\n", seq_var.pos_t);
 
     if (eva->fix_enabled) {
-        if (eva->var_count >= eva->var_capacity) {
-            eva->var_capacity = eva->var_capacity ? eva->var_capacity * 2 : 10;
-            eva->variations = realloc(eva->variations, eva->var_capacity * sizeof(variation_t));
-        }
-        variation_t *var = &eva->variations[eva->var_count++];
-        strncpy(var->chrom, eva->var_locs[var_loc_p].name, sizeof(var->chrom));
-        var->chrom[sizeof(var->chrom)-1] = '\0';
-        
-        // Calculate genomic position based on k-mer start and k size
-        var->pos = ref_var.pos_s + eva->k + 1; // 1-based end position of k-mer
-        
-        strncpy(var->ref, (const char*)ref_seq, sizeof(var->ref));
-        var->ref[sizeof(var->ref)-1] = '\0';
-        strncpy(var->alt, (const char*)path_seq, sizeof(var->alt));
-        var->alt[sizeof(var->alt)-1] = '\0';
-        
-        if(slim_path_len > ref_seq_len) {
-            strcpy(var->type, "INS");
-        } else if(slim_path_len < ref_seq_len) {
-            strcpy(var->type, "DEL");
-        } else {
-            strcpy(var->type, "SUB");
-        }
+        record_variation(eva, eva->var_locs[var_loc_p].name,
+                         ref_var.pos_s + eva->k + 1,
+                         (const char *)ref_seq, strlen((const char *)ref_seq),
+                         (const char *)path_seq, strlen((const char *)path_seq),
+                         var_type);
     }
+    free(path_kms);
+    free(ref_seq);
+    free(path_seq);
     return 0;
 }
 
@@ -1414,22 +1456,82 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
     return eva;
 }
 
+static int apply_variation_to_sequence(char **sequence, int *len,
+                                       const char *seqname, const variation_t *var)
+{
+    if (sequence == NULL || *sequence == NULL || len == NULL || var == NULL ||
+        var->ref == NULL || var->alt == NULL) {
+        return 0;
+    }
+
+    size_t ref_len = strlen(var->ref);
+    size_t alt_len = strlen(var->alt);
+    int pos = var->pos - 1; // Convert to 0-based.
+
+    if (pos < 0 || pos > *len) {
+        fprintf(stderr, "  Skip: Position %d out of bounds for sequence %s (length: %d)\n",
+                var->pos, seqname, *len);
+        return 0;
+    }
+    if ((size_t)pos + ref_len > (size_t)*len) {
+        fprintf(stderr, "  Skip: Reference length exceeds sequence bounds at %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+    if (ref_len > 0 && strncmp(*sequence + pos, var->ref, ref_len) != 0) {
+        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
+        fprintf(stderr, "    Expected: '%s'\n", var->ref);
+        fprintf(stderr, "    Found: '%.10s'\n", *sequence + pos);
+        return 0;
+    }
+
+    size_t new_len = (size_t)*len - ref_len + alt_len;
+    if (new_len > (size_t)INT_MAX) {
+        fprintf(stderr, "  Skip: Edited sequence would exceed supported length at %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+
+    if (ref_len == alt_len) {
+        if (alt_len > 0) memcpy(*sequence + pos, var->alt, alt_len);
+        return 1;
+    }
+
+    char *new_seq = malloc(new_len + 1);
+    if (!new_seq) {
+        fprintf(stderr, "  Error: Memory allocation failed while applying %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+
+    memcpy(new_seq, *sequence, (size_t)pos);
+    if (alt_len > 0) memcpy(new_seq + pos, var->alt, alt_len);
+    memcpy(new_seq + pos + alt_len, *sequence + pos + ref_len,
+           (size_t)*len - (size_t)pos - ref_len);
+    new_seq[new_len] = '\0';
+
+    free(*sequence);
+    *sequence = new_seq;
+    *len = (int)new_len;
+    return 1;
+}
+
 // Complete the apply_variations function to include INS and DEL handling
 void apply_variations(evaluation_t *eva, const char *ref_file, const char *output_base) {
-    char *output_fn = strdup(output_base);
-    
+    if (eva == NULL || ref_file == NULL || output_base == NULL) return;
+
     gzFile fp = gzopen(ref_file, "r");
     if (!fp) {
         fprintf(stderr, "Failed to open reference file %s\n", ref_file);
-        free(output_fn);
         return;
     }
 
     kseq_t *seq = kseq_init(fp);
-    FILE *out_fp = fopen(output_fn, "w");
+    FILE *out_fp = fopen(output_base, "w");
     if (!out_fp) {
-        fprintf(stderr, "Failed to open output file %s\n", output_fn);
-        free(output_fn);
+        fprintf(stderr, "Failed to open output file %s\n", output_base);
+        kseq_destroy(seq);
+        gzclose(fp);
         return;
     }
 
@@ -1442,6 +1544,10 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
         char *seqname = seq->name.s;
         char *sequence = strdup(seq->seq.s);
         int len = seq->seq.l;
+        if (sequence == NULL) {
+            fprintf(stderr, "Failed to allocate sequence buffer for %s\n", seqname);
+            continue;
+        }
         
         fprintf(stderr, "Processing sequence: %s (length: %d)\n", seqname, len);
         
@@ -1450,7 +1556,8 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
         variation_t *seq_variations = NULL;
         
         for (int i = 0; i < eva->var_count; i++) {
-            if (strcmp(eva->variations[i].chrom, seqname) == 0) {
+            if (eva->variations[i].chrom != NULL &&
+                strcmp(eva->variations[i].chrom, seqname) == 0) {
                 seq_var_count++;
             }
         }
@@ -1461,7 +1568,8 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
             int j = 0;
             
             for (int i = 0; i < eva->var_count; i++) {
-                if (strcmp(eva->variations[i].chrom, seqname) == 0) {
+                if (eva->variations[i].chrom != NULL &&
+                    strcmp(eva->variations[i].chrom, seqname) == 0) {
                     seq_variations[j++] = eva->variations[i];
                 }
             }
@@ -1472,103 +1580,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
             // Apply variations to this sequence
             for (int i = 0; i < seq_var_count; i++) {
                 variation_t *var = &seq_variations[i];
-                int pos = var->pos - 1; // Convert to 0-based
-                
-                if (pos < 0 || pos >= len) {
-                    fprintf(stderr, "  Skip: Position %d out of bounds for sequence %s (length: %d)\n", 
-                            var->pos, seqname, len);
-                    continue;
-                }
-
-                // Debug output before applying variation
-                // fprintf(stderr, "Applying variation at position %d:\n", var->pos);
-                // fprintf(stderr, "  Type: %s\n", var->type);
-                // fprintf(stderr, "  REF: '%s'\n", var->ref);
-                // fprintf(stderr, "  ALT: '%s'\n", var->alt);
-                // fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
-
-                if (strcmp(var->type, "SUB") == 0) {
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    if (pos + ref_len > len) {
-                        fprintf(stderr, "  Skip: Reference length exceeds sequence bounds\n");
-                        continue;
-                    }
-                    if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                        fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                        fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                        continue;
-                    }
-                    // Replace REF with ALT
-                    memcpy(&sequence[pos], var->alt, alt_len);
-                    // fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
-                } else if (strcmp(var->type, "INS") == 0) {
-                    // Insert ALT after POS (VCF format)
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    int ins_len = alt_len - ref_len;  // True insertion length
-                    
-                    // Check for REF mismatch if REF has content
-                    if (ref_len > 0) {
-                        if (pos + ref_len > len) {
-                            fprintf(stderr, "  Skip: Reference length exceeds sequence bounds\n");
-                            continue;
-                        }
-                        if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                            fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                            fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                            fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                            continue;
-                        }
-                    }
-                    
-                    // For insertions, we need to allocate more space
-                    char *new_seq = malloc(len + ins_len + 1);
-                    if (!new_seq) {
-                        fprintf(stderr, "  Error: Memory allocation failed for insertion\n");
-                        continue;
-                    }
-                    
-                    // Copy sequence up to the insertion point
-                    memcpy(new_seq, sequence, pos + ref_len);
-                    // Insert ALT (which includes the REF part)
-                    memcpy(new_seq + pos, var->alt, alt_len);
-                    // Copy the remainder of the sequence
-                    memcpy(new_seq + pos + alt_len, sequence + pos + ref_len, len - pos - ref_len);
-                    // Null terminate
-                    new_seq[len + ins_len] = '\0';
-                    
-                    // Clean up and update
-                    free(sequence);
-                    sequence = new_seq;
-                    len += ins_len;
-                    
-                    // fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
-                } else if (strcmp(var->type, "DEL") == 0) {
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    int del_len = ref_len - alt_len;
-                    
-                    if (pos + ref_len > len || del_len <= 0) {
-                        fprintf(stderr, "  Skip: Invalid deletion parameters\n");
-                        continue;
-                    }
-                    
-                    if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                        fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                        fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                        continue;
-                    }
-                    
-                    // Replace with ALT and delete remaining bases
-                    memcpy(&sequence[pos], var->alt, alt_len);
-                    memmove(&sequence[pos + alt_len], &sequence[pos + ref_len], len - pos - ref_len + 1); // +1 for null terminator
-                    len -= del_len;
-                    
-                    // fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
-                }
+                apply_variation_to_sequence(&sequence, &len, seqname, var);
             }
             
             // Free sequence-specific variations
@@ -1583,8 +1595,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
     kseq_destroy(seq);
     gzclose(fp);
     fclose(out_fp);
-    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_fn);
-    free(output_fn);
+    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_base);
 }
 
 
@@ -1789,6 +1800,13 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
     fwrite(ALT + head, 1, (size_t)a_len, eva->vcf_out);
     fprintf(eva->vcf_out, "\t.\tPASS\tKMER_COV=%d;VARTYPE=%s;SOURCE=BACKFILL\n",
             path_cov, var_type);
+
+    if (eva->fix_enabled && vcf_pos <= (uint32_t)INT_MAX) {
+        record_variation(eva, ctx->contig_names[l_cidx], (int)vcf_pos,
+                         (const char *)REF + head, (size_t)r_len,
+                         (const char *)ALT + head, (size_t)a_len,
+                         var_type);
+    }
 
     free(REF);
     free(ALT);
@@ -2250,14 +2268,9 @@ int main(int argc, char *argv[])
         eva.hr = hr;
         eva.vcf_out = vcf_fp;
         eva.iteration = iter;
-        eva.var_count = 0;
-        eva.var_capacity = 0;
         
         // Free previous variations if any
-        if (eva.variations != NULL) {
-            free(eva.variations);
-        }
-        eva.variations = NULL;
+        free_variations(&eva);
         
         // Reset pointers to prevent dangling pointers
         eva.var_locs = NULL;
@@ -2306,10 +2319,7 @@ int main(int argc, char *argv[])
         }
         
         // Cleanup from this iteration
-        if (eva.variations != NULL) {
-            free(eva.variations);
-            eva.variations = NULL;
-        }
+        free_variations(&eva);
         
         // Free the reference hash for this iteration
         for (int i = 0; i < (1<<p); i++) {
@@ -2327,9 +2337,7 @@ int main(int argc, char *argv[])
     free(eva.all_nodes);
     free(eva.term_nodes);
     free(eva.good_term_nodes);
-    if (eva.variations != NULL) {
-        free(eva.variations);
-    }
+    free_variations(&eva);
     if (eva.used_kmers != NULL) {
         u64set_destroy(eva.used_kmers);
         eva.used_kmers = NULL;
