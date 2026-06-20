@@ -44,6 +44,13 @@ int main(int argc, char **argv)
     memset(&eva, 0, sizeof(eva));
     eva.fix_enabled = 1;
 
+    var_location ref_var;
+    memset(&ref_var, 0, sizeof(ref_var));
+    ref_var.pos_s = 257867;
+    if (varcall_vcf_pos(&ref_var, 31, "DEL") != 257899) return 5;
+    if (varcall_vcf_pos(&ref_var, 31, "SUB") != 257899) return 6;
+
+    record_variation(&eva, long_name, 3, "C", 1, "T", 1, "SUB");
     record_variation(&eva, long_name, 3, "C", 1, "T", 1, "SUB");
 
     char *big_ref = malloc(1101);
@@ -71,6 +78,11 @@ cc -g -Wall -O0 -I"$repo_root" \
     -lz -lm -lpthread
 
 "$tmpdir/apply_variations_harness" "$tmpdir" >/dev/null 2>"$tmpdir/harness.stderr"
+
+if grep -q "REF mismatch" "$tmpdir/harness.stderr"; then
+    cat "$tmpdir/harness.stderr" >&2
+    exit 1
+fi
 
 python3 - "$tmpdir/fixed.fa" <<'PY'
 import sys
