@@ -401,13 +401,18 @@ static kc_c4x_t *count_file2(const char *fn, kc_c4x_t *hh, int k, int p, int blo
 
 int kmer_cov(uint64_t kmer, uint64_t mask, kc_c4x_t *h){
 
-    int j, x, cov=0, a_key;
+    int j, cov=0;
+    khint_t x;
+    uint64_t a_key;
     uint64_t hash_key = hash64(kmer, mask);
     j = hash_key & ((1<<KC_BITS) - 1);
     if(kh_size(h->h[j]) < 1){return 0;}
 
     hash_key = hash_key >> KC_BITS<< KC_BITS;
     x = kc_c4_get(h->h[j], hash_key);
+    if (x == kh_end(h->h[j])) {
+        return 0;
+    }
 
     if(kh_exist(h->h[j], x)){
         a_key = kh_key(h->h[j], x); 
@@ -1781,7 +1786,7 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
     uint32_t contig_len = ctx->contig_lens[l_cidx];
     if (R_pos + (uint32_t)k - 1 > contig_len) return 0;
     int ref_span = (int)(R_pos - L_pos) + k;
-    if (ref_span != seq_len) return 0;              // length mismatch (defensive)
+    if (ref_span < k || seq_len < k) return 0;
 
     // Build REF and ALT strings.
     unsigned char *REF = malloc((size_t)ref_span + 1);
@@ -1807,7 +1812,9 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
     while (r_len > 1 && a_len > 1 && REF[r_len - 1] == ALT[a_len - 1]) { r_len--; a_len--; }
     while (r_len > 1 && a_len > 1 && REF[head] == ALT[head])          { r_len--; a_len--; head++; }
 
-    if (r_len == a_len && r_len == 0) { free(REF); free(ALT); return 0; }
+    if (r_len == a_len && memcmp(REF + head, ALT + head, (size_t)r_len) == 0) {
+        free(REF); free(ALT); return 0;
+    }
     uint32_t vcf_pos = L_pos + (uint32_t)head;
 
     const char *var_type = "SUB";
