@@ -1858,8 +1858,8 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
 // so "present in NGS but missing from the reference" alone is NOT the
 // correct candidate set.
 //
-// For each candidate starting k-mer, greedily extend the unitig in both
-// directions on the NGS De Bruijn graph. An anchor is reached when the
+// For each candidate starting k-mer, search all coverage-qualified paths in
+// both directions on the NGS De Bruijn graph. An anchor is reached when the
 // walk meets (a) a reference k-mer, or (b) a k-mer already on an accepted
 // variant/back-fill path (i.e. an element of eva->used_kmers). A walk that
 // runs into a contamination-flagged k-mer (eva->contam_kmers) is NOT
@@ -1871,7 +1871,33 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
 // are left untouched so they can still be analyzed on their own merit.
 // ===================================================================
 
-// Greedy unitig-style walk on the NGS De Bruijn graph.
+typedef struct {
+    uint64_t kmer;
+    int parent;
+    int depth;
+    int terminal;
+} backfill_path_state_t;
+
+static int backfill_state_seen(backfill_path_state_t *states, int n, uint64_t kmer)
+{
+    for (int i = 0; i < n; i++) {
+        if (states[i].kmer == kmer) return 1;
+    }
+    return 0;
+}
+
+static void backfill_copy_path(backfill_path_state_t *states, int idx,
+                               uint64_t *path_out, int *path_len_out)
+{
+    int n = states[idx].depth;
+    *path_len_out = n;
+    for (int i = n - 1; i >= 0; i--) {
+        path_out[i] = states[idx].kmer;
+        idx = states[idx].parent;
+    }
+}
+
+// Bounded multi-path search on the NGS De Bruijn graph.
 //   direction = +1 : extend forward  (append base to 3' end of y)
 //   direction = -1 : extend backward (prepend base to 5' end of y)
 // Returns 1 when a reference k-mer anchor is reached (anchor_out set to
@@ -1885,54 +1911,95 @@ static int backfill_extend(evaluation_t *eva, uint64_t start_fwd, int direction,
     int k = eva->k;
     uint64_t mask = (1ULL << (k * 2)) - 1;
     uint64_t shift = (uint64_t)(k - 1) * 2;
-    uint64_t y = start_fwd;
-    int steps = 0;
-    *path_len_out = 0;
+    backfill_path_state_t states[Max_Path_Num];
+    int head = 0;
+    int n_states = 1;
+    int saw_edge = 0;
+    int truncated = 0;
+    int fallback_idx = -1;
+    uint64_t fallback_anchor = 0;
+    int prefer_canonical_anchor = (start_fwd == min_hash_key(start_fwd, k));
 
-    while (steps < max_len) {
-        int best_b = -1, best_cov = 0;
-        uint64_t best_next = 0;
+    *path_len_out = 0;
+    states[0].kmer = start_fwd;
+    states[0].parent = -1;
+    states[0].depth = 0;
+    states[0].terminal = 0;
+
+    while (head < n_states) {
+        backfill_path_state_t *cur = &states[head];
+        if (cur->terminal) {
+            head++;
+            continue;
+        }
+        if (cur->depth >= max_len) {
+            truncated = 1;
+            head++;
+            continue;
+        }
         for (int b = 0; b < 4; b++) {
             uint64_t nxt;
             if (direction > 0) {
-                nxt = ((y << 2) | (uint64_t)b) & mask;
+                nxt = ((cur->kmer << 2) | (uint64_t)b) & mask;
             } else {
-                nxt = (y >> 2) | ((uint64_t)b << shift);
+                nxt = (cur->kmer >> 2) | ((uint64_t)b << shift);
             }
-            if (nxt == y) continue; // homopolymer self-loop guard
+            if (nxt == cur->kmer) continue; // homopolymer self-loop guard
             uint64_t can = min_hash_key(nxt, k);
             int cov = kmer_cov(can, mask, eva->h);
-            if (cov >= min_cov && cov > best_cov) {
-                best_cov = cov;
-                best_next = nxt;
-                best_b = b;
+            if (cov < min_cov) continue;
+            saw_edge = 1;
+            if (backfill_state_seen(states, n_states, nxt)) continue;
+            if (n_states >= Max_Path_Num) {
+                truncated = 1;
+                continue;
             }
-        }
-        if (best_b < 0) {
-            return -1; // dead-end in NGS graph
-        }
-        y = best_next;
-        path_out[(*path_len_out)++] = y;
-        uint64_t y_can = min_hash_key(y, k);
 
-        // If this canonical k-mer is already on an accepted variant path or
-        // accepted back-fill novel path, treat it as a valid anchor so the
-        // novel region joins cleanly with known paths. Note: contamination
-        // k-mers are stored in eva->contam_kmers (NOT used_kmers) and must
-        // NOT satisfy this anchor condition.
-        if (u64set_contains(eva->used_kmers, y_can)) {
-            *anchor_out = y_can;
-            return 1;
-        }
+            int next_idx = n_states++;
+            states[next_idx].kmer = nxt;
+            states[next_idx].parent = head;
+            states[next_idx].depth = cur->depth + 1;
+            states[next_idx].terminal = 0;
 
-        int rcov = kmer_cov(y_can, mask, eva->hr);
-        if (rcov > 0) {
-            *anchor_out = y_can;
-            return 1;
+            int is_anchor = 0;
+
+            // If this canonical k-mer is already on an accepted variant path or
+            // accepted back-fill novel path, treat it as a valid anchor so the
+            // novel region joins cleanly with known paths. Note: contamination
+            // k-mers are stored in eva->contam_kmers (NOT used_kmers) and must
+            // NOT satisfy this anchor condition.
+            if (u64set_contains(eva->used_kmers, can)) {
+                *anchor_out = can;
+                backfill_copy_path(states, next_idx, path_out, path_len_out);
+                return 1;
+            }
+
+            int rcov = kmer_cov(can, mask, eva->hr);
+            if (rcov > 0) {
+                uint64_t can_rc = comp_rev(can, k);
+                int palindrome = (can == can_rc);
+                int preferred = palindrome || ((nxt == can) == prefer_canonical_anchor);
+                is_anchor = 1;
+                if (preferred) {
+                    *anchor_out = can;
+                    backfill_copy_path(states, next_idx, path_out, path_len_out);
+                    return 1;
+                }
+                if (fallback_idx < 0) {
+                    fallback_idx = next_idx;
+                    fallback_anchor = can;
+                }
+            }
+            states[next_idx].terminal = is_anchor;
         }
-        steps++;
+        head++;
     }
-    return 0; // reached max length without anchor
+    if (fallback_idx >= 0) {
+        *anchor_out = fallback_anchor;
+        backfill_copy_path(states, fallback_idx, path_out, path_len_out);
+        return 1;
+    }
+    return saw_edge || truncated ? 0 : -1;
 }
 
 static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path)

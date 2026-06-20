@@ -30,8 +30,12 @@ int main(int argc, char **argv)
 
     char ref_path[4096];
     char vcf_path[4096];
+    char branch_ref_path[4096];
+    char branch_reads_path[4096];
     snprintf(ref_path, sizeof(ref_path), "%s/ref.fa", argv[1]);
     snprintf(vcf_path, sizeof(vcf_path), "%s/backfill.vcf", argv[1]);
+    snprintf(branch_ref_path, sizeof(branch_ref_path), "%s/branch_ref.fa", argv[1]);
+    snprintf(branch_reads_path, sizeof(branch_reads_path), "%s/branch_reads.fa", argv[1]);
 
     FILE *ref = fopen(ref_path, "w");
     if (ref == NULL) return 3;
@@ -63,6 +67,45 @@ int main(int argc, char **argv)
                                     7);
     fclose(vcf);
     ref_pos_ctx_free(&ctx);
+
+    FILE *branch_ref = fopen(branch_ref_path, "w");
+    if (branch_ref == NULL) return 8;
+    fprintf(branch_ref, ">ref\\nAAACCC\\n");
+    fclose(branch_ref);
+
+    FILE *branch_reads = fopen(branch_reads_path, "w");
+    if (branch_reads == NULL) return 9;
+    for (int i = 0; i < 20; i++) fprintf(branch_reads, ">dead_%d\\nAAAGTAC\\n", i);
+    for (int i = 0; i < 5; i++) fprintf(branch_reads, ">real_%d\\nAAAGGCCC\\n", i);
+    fclose(branch_reads);
+
+    evaluation_t branch_eva;
+    memset(&branch_eva, 0, sizeof(branch_eva));
+    branch_eva.k = 3;
+    branch_eva.h = count_file(branch_reads_path, 3, KC_BITS, 100000, 1);
+    branch_eva.hr = count_file(branch_ref_path, 3, KC_BITS, 100000, 1);
+    branch_eva.used_kmers = u64set_init();
+
+    uint64_t start_fwd = 0, expected_anchor = 0;
+    uint64_t expected_path[2], found_path[16], found_anchor = 0;
+    int found_len = 0;
+    if (encode_one("AAG", 3, &start_fwd) != 0 ||
+        encode_one("CCC", 3, &expected_anchor) != 0 ||
+        encode_one("AGG", 3, &expected_path[0]) != 0 ||
+        encode_one("GGG", 3, &expected_path[1]) != 0) {
+        return 10;
+    }
+
+    int found = backfill_extend(&branch_eva, start_fwd, +1, 5, 2,
+                                found_path, &found_len, &found_anchor);
+    if (found != 1 || found_len != 2 ||
+        found_anchor != min_hash_key(expected_anchor, 3)) {
+        return 11;
+    }
+    for (int i = 0; i < 2; i++) {
+        if (found_path[i] != expected_path[i]) return 12;
+    }
+
     free_variations(&eva);
 
     return emitted == 1 ? 0 : 7;
