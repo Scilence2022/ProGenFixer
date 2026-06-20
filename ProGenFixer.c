@@ -523,6 +523,7 @@ typedef struct { // data structure for file evaluation
     int max_assem_cov; // Added max assembly coverage
 
     uint64_t *kms;
+    int kms_count;
     int k;
     int p;
     var_location *var_locs;
@@ -1170,6 +1171,10 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
         fprintf(stderr, "Error: Invalid parameters\n");
         return 0;
     }
+    if (eva->kms_count <= 0) {
+        fprintf(stderr, "Error: Invalid k-mer array size\n");
+        return 0;
+    }
     
     int k = eva->k;
     uint64_t mask = (1ULL<<k*2) - 1;
@@ -1189,8 +1194,9 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     }
     
     var_loc->pos_t = var_loc->pos_t + dis;
-    // We don't know the upper bound without knowing the size of kms array
-    // So we'll rely on the cov check to prevent going too far
+    if (var_loc->pos_t >= eva->kms_count) {
+        var_loc->pos_t = eva->kms_count - 1;
+    }
     
     int cov_s = kmer_cov(min_hash_key(kms[var_loc->pos_s], k), mask, eva->h);
     int cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
@@ -1209,7 +1215,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     itt = 0;
     // We need to limit how far we can extend to avoid going out of bounds
     int max_extension = MAX_EXTENT_DISTANCE;
-    while (cov_t <= assem_min_cov && itt < dis && itt < max_extension) {
+    while (cov_t <= assem_min_cov && itt < dis && itt < max_extension && var_loc->pos_t < eva->kms_count - 1) {
         var_loc->pos_t = var_loc->pos_t + 1;
         cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
         itt = itt + 1;
@@ -1265,6 +1271,39 @@ int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, in
     return 1;
 } 
 
+static int append_var_location(evaluation_t *eva, var_location *var_locs, int *var_loc_num,
+                               int var_loc_capacity, uint64_t *kms, int pos_s, int pos_t,
+                               int term_cov, uint64_t mask, const char *seq_name)
+{
+    int k = eva->k;
+
+    if (pos_s < 0 || pos_t <= pos_s || pos_t >= eva->kms_count) return 0;
+    if (pos_t - pos_s <= k) return 0;
+
+    if (*var_loc_num >= var_loc_capacity) {
+        fprintf(stderr, "Warning: variation-location buffer is full; skipping remaining locations\n");
+        return -1;
+    }
+
+    int rep_km_num = kmer_cov(min_hash_key(kms[pos_t], k), mask, eva->hr);
+    int s_km_cov = kmer_cov(min_hash_key(kms[pos_s], k), mask, eva->h);
+
+    if (rep_km_num >= MAX_REP_KM_NUM) return 0;
+    if (term_cov <= 0 || (long long)s_km_cov > (long long)term_cov * MAX_COV_RATIO) return 0;
+
+    var_location *loc = &var_locs[*var_loc_num];
+    loc->kmer_s = kms[pos_s];
+    loc->pos_s = pos_s;
+    loc->kmer_t = kms[pos_t];
+    loc->pos_t = pos_t;
+
+    strncpy(loc->name, seq_name, sizeof(loc->name) - 1);
+    loc->name[sizeof(loc->name) - 1] = '\0';
+
+    (*var_loc_num)++;
+    return 1;
+}
+
 // Search for locations with variations
 static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max_len, int min_cov, int assem_min_cov)
 {
@@ -1297,50 +1336,48 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         // Allocate memory for this sequence
         MALLOC(kms, l); 
         km_num = seq_kmers(kms, k, l, pl.ks->seq.s);
+        eva->kms = kms;
+        eva->kms_count = km_num;
         
         MALLOC(var_locs, (l-k + 1));
         
         // Reset variation locations counter for this sequence
         int var_loc_num = 0;
-        var_location one_var_loc;
-        one_var_loc.kmer_s = 0;
-        one_var_loc.pos_s = -1;
+        int last_anchor_pos = -1;
+        int open_var_pos_s = -1;
+        int in_low_cov_run = 0;
+        int low_cov_kmers = 0;
+        // -c opens low-coverage candidates; -a closes them with assembly-usable anchors.
+        int anchor_min_cov = assem_min_cov > 0 ? assem_min_cov : min_cov;
         
         // Find variation locations for this sequence
         int j = 0;
         while(j < km_num) {
             int cov = kmer_cov(min_hash_key(kms[j],k), mask, eva->h);
-            
-            if(cov < min_cov) { // k-mer NOT present 
-                if(one_var_loc.pos_s < 0 && j > k) {
-                    one_var_loc.kmer_s = kms[j-1];
-                    one_var_loc.pos_s = j - 1;
-                }
-            } else { // k-mer present
-                if(one_var_loc.pos_s > 0) {
-                    int rep_km_num = kmer_cov(min_hash_key(kms[j],k), mask, eva->hr); 
-                    int s_km_cov = kmer_cov(min_hash_key(one_var_loc.kmer_s,k), mask, eva->h);
-                    
-                    if(rep_km_num < MAX_REP_KM_NUM && (cov > 0 && s_km_cov/cov <= MAX_COV_RATIO)) {
-                        var_locs[var_loc_num].kmer_s = one_var_loc.kmer_s;
-                        var_locs[var_loc_num].pos_s = one_var_loc.pos_s;
-                        var_locs[var_loc_num].kmer_t = kms[j];
-                        var_locs[var_loc_num].pos_t = j;
-                        
-                        strncpy(var_locs[var_loc_num].name, pl.ks->name.s, sizeof(var_locs[var_loc_num].name)-1);
-                        var_locs[var_loc_num].name[sizeof(var_locs[var_loc_num].name)-1] = '\0';
-                        
-                        if(var_locs[var_loc_num].pos_t - var_locs[var_loc_num].pos_s <= k) {
-                            var_locs[var_loc_num].pos_t = var_locs[var_loc_num].pos_s + k + 1;
-                            var_locs[var_loc_num].kmer_t = kms[var_locs[var_loc_num].pos_t];
-                        }
-                        
-                        one_var_loc.kmer_s = 0;
-                        one_var_loc.pos_s = -1;
-                        var_loc_num++;
-                    }
+            int is_low_cov = cov < min_cov;
+            int is_anchor = cov >= anchor_min_cov;
+            int starts_low_cov_run = is_low_cov && !in_low_cov_run;
+
+            if (is_low_cov) low_cov_kmers++;
+
+            if (open_var_pos_s >= 0 && is_anchor) {
+                int added = append_var_location(eva, var_locs, &var_loc_num, km_num, kms,
+                                                open_var_pos_s, j, cov, mask, pl.ks->name.s);
+                if (added < 0) break;
+                if (added > 0) {
+                    open_var_pos_s = -1;
+                    last_anchor_pos = j;
                 }
             }
+
+            if (open_var_pos_s < 0) {
+                if (starts_low_cov_run && last_anchor_pos >= 0 && last_anchor_pos < j && j > k) {
+                    open_var_pos_s = last_anchor_pos;
+                } else if (is_anchor) {
+                    last_anchor_pos = j;
+                }
+            }
+            in_low_cov_run = is_low_cov;
             j++;
         }
         
@@ -1348,7 +1385,9 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         eva->var_locs = var_locs;
         eva->kms = kms;
         
-        fprintf(stderr, "Found %d variation locations in sequence: %s\n", var_loc_num, pl.ks->name.s);
+        fprintf(stderr,
+                "Found %d variation locations in sequence: %s (low-coverage k-mers: %d, region min: %d, anchor min: %d)\n",
+                var_loc_num, pl.ks->name.s, low_cov_kmers, min_cov, anchor_min_cov);
         
 
 
@@ -1365,6 +1404,7 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         free(kms);
         free(var_locs);
         eva->kms = NULL;
+        eva->kms_count = 0;
         eva->var_locs = NULL;
     }
 
