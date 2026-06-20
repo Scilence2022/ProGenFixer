@@ -585,13 +585,27 @@ static void free_variations(evaluation_t *eva)
     eva->var_capacity = 0;
 }
 
-static void record_variation(evaluation_t *eva, const char *chrom, int pos,
-                             const char *ref, size_t ref_len,
-                             const char *alt, size_t alt_len,
-                             const char *type)
+static int record_variation(evaluation_t *eva, const char *chrom, int pos,
+                            const char *ref, size_t ref_len,
+                            const char *alt, size_t alt_len,
+                            const char *type)
 {
-    if (eva == NULL || chrom == NULL || ref == NULL || alt == NULL || type == NULL) return;
-    if (pos <= 0) return;
+    if (eva == NULL || chrom == NULL || ref == NULL || alt == NULL || type == NULL) return 0;
+    if (pos <= 0) return 0;
+
+    for (int i = 0; i < eva->var_count; i++) {
+        variation_t *old = &eva->variations[i];
+        if (old->chrom == NULL || old->ref == NULL || old->alt == NULL) continue;
+        if (old->pos == pos &&
+            strcmp(old->chrom, chrom) == 0 &&
+            strcmp(old->type, type) == 0 &&
+            strlen(old->ref) == ref_len &&
+            strlen(old->alt) == alt_len &&
+            memcmp(old->ref, ref, ref_len) == 0 &&
+            memcmp(old->alt, alt, alt_len) == 0) {
+            return 0;
+        }
+    }
 
     if (eva->var_count >= eva->var_capacity) {
         eva->var_capacity = eva->var_capacity ? eva->var_capacity * 2 : 10;
@@ -606,6 +620,14 @@ static void record_variation(evaluation_t *eva, const char *chrom, int pos,
     var->alt = pgf_strndup(alt, alt_len);
     strncpy(var->type, type, sizeof(var->type) - 1);
     var->type[sizeof(var->type) - 1] = '\0';
+    return 1;
+}
+
+static int varcall_vcf_pos(const var_location *ref_var, int k, const char *var_type)
+{
+    if (ref_var == NULL || var_type == NULL) return 0;
+    (void)var_type;
+    return ref_var->pos_s + k + 1;
 }
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
@@ -904,23 +926,13 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     int slim_path_len = seq_var.pos_t - seq_var.pos_s - k + 2; 
     CALLOC(path_seq, slim_path_len + 500);
 
-    fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
     char info_field[200];
     char var_type[4];
 
     if(slim_path_len >= ref_seq_len){
         kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
         kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k + 1); 
-        fprintf(eva->vcf_out, ".\t"); // ID
-        fprintf(eva->vcf_out, "%s\t", ref_seq);
-        fprintf(eva->vcf_out, "%s\t", path_seq);
-        fprintf(eva->vcf_out, ".\t"); // QUAL
-        fprintf(eva->vcf_out, "PASS\t"); // FILTER
         if(slim_path_len > ref_seq_len){strcpy(var_type, "INS"); }else{strcpy(var_type, "SUB"); }
-        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s;SOURCE=VARCALL", path_cov, var_type);
-        fprintf(eva->vcf_out, "%s", info_field);
-
     }
     if(slim_path_len < ref_seq_len){ // Deletion
         if(slim_path_len < 0){
@@ -930,30 +942,30 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k ); // POS for DEL is 1-based pos before deletion
+        strcpy(var_type, "DEL");
+    }
+    int vcf_pos = varcall_vcf_pos(&ref_var, k, var_type);
+    int is_new_variant = record_variation(eva, eva->var_locs[var_loc_p].name, vcf_pos,
+                                          (const char *)ref_seq, strlen((const char *)ref_seq),
+                                          (const char *)path_seq, strlen((const char *)path_seq),
+                                          var_type);
+    if (is_new_variant) {
+        fprintf(eva->vcf_out, "%s\t", eva->var_locs[var_loc_p].name);
+        fprintf(eva->vcf_out, "%d\t", vcf_pos);
         fprintf(eva->vcf_out, ".\t"); // ID
-        fprintf(eva->vcf_out, "%s\t", ref_seq); // REF
-        fprintf(eva->vcf_out, "%s\t", path_seq); // ALT (should be the base before deletion if ALT is single base)
+        fprintf(eva->vcf_out, "%s\t", ref_seq);
+        fprintf(eva->vcf_out, "%s\t", path_seq);
         fprintf(eva->vcf_out, ".\t"); // QUAL
         fprintf(eva->vcf_out, "PASS\t"); // FILTER
-        strcpy(var_type, "DEL");
         snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s;SOURCE=VARCALL", path_cov, var_type);
-        fprintf(eva->vcf_out, "%s", info_field);
+        fprintf(eva->vcf_out, "%s\n", info_field);
     }
-    fprintf(eva->vcf_out, "\n");
     
     // fprintf(stdout, "##### ref_var.pos_s: %d \t", ref_var.pos_s);
     // fprintf(stdout, " ref_var.pos_t: %d \t", ref_var.pos_t);
     // fprintf(stdout, " new_var start_pos: %d \t", seq_var.pos_s);
     // fprintf(stdout, " new_var term_pos: %d \n\n\n\n\n", seq_var.pos_t);
 
-    if (eva->fix_enabled) {
-        record_variation(eva, eva->var_locs[var_loc_p].name,
-                         ref_var.pos_s + eva->k + 1,
-                         (const char *)ref_seq, strlen((const char *)ref_seq),
-                         (const char *)path_seq, strlen((const char *)path_seq),
-                         var_type);
-    }
     free(path_kms);
     free(ref_seq);
     free(path_seq);
@@ -1793,6 +1805,16 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
     if (a_len > r_len)      var_type = "INS";
     else if (a_len < r_len) var_type = "DEL";
 
+    if (vcf_pos > (uint32_t)INT_MAX ||
+        !record_variation(eva, ctx->contig_names[l_cidx], (int)vcf_pos,
+                          (const char *)REF + head, (size_t)r_len,
+                          (const char *)ALT + head, (size_t)a_len,
+                          var_type)) {
+        free(REF);
+        free(ALT);
+        return 0;
+    }
+
     // Emit VCF record.
     fprintf(eva->vcf_out, "%s\t%u\t.\t", ctx->contig_names[l_cidx], vcf_pos);
     fwrite(REF + head, 1, (size_t)r_len, eva->vcf_out);
@@ -1800,13 +1822,6 @@ static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
     fwrite(ALT + head, 1, (size_t)a_len, eva->vcf_out);
     fprintf(eva->vcf_out, "\t.\tPASS\tKMER_COV=%d;VARTYPE=%s;SOURCE=BACKFILL\n",
             path_cov, var_type);
-
-    if (eva->fix_enabled && vcf_pos <= (uint32_t)INT_MAX) {
-        record_variation(eva, ctx->contig_names[l_cidx], (int)vcf_pos,
-                         (const char *)REF + head, (size_t)r_len,
-                         (const char *)ALT + head, (size_t)a_len,
-                         var_type);
-    }
 
     free(REF);
     free(ALT);
@@ -2301,8 +2316,8 @@ int main(int argc, char *argv[])
         }
         fclose(vcf_fp);
 
-        // Apply corrections if we found any variations
-        if (eva.var_count > 0) {
+        // Apply corrections if requested and we found any unique variations.
+        if (fix_enabled && eva.var_count > 0) {
             char new_ref[256];
             snprintf(new_ref, sizeof(new_ref), "%s.iter%d.fasta", output_base, iter);
             fprintf(stderr, "Applying %d variations to create %s\n", eva.var_count, new_ref);
@@ -2314,7 +2329,7 @@ int main(int argc, char *argv[])
             }
             current_ref = strdup(new_ref);
             fprintf(stderr, "Next reference: %s\n", current_ref);
-        } else {
+        } else if (fix_enabled) {
             fprintf(stderr, "No variations found in iteration %d, using same reference for next iteration\n", iter);
         }
         
