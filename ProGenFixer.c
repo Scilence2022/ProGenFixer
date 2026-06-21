@@ -6,6 +6,8 @@
 #include <time.h> 
 #include <math.h>
 #include <unistd.h>
+#include <limits.h>
+#include <string.h>
 
 #include "ketopt.h" // command-line argument parser
 #include "kthread.h" // multi-threading models: pipeline and multi-threaded for loop
@@ -44,6 +46,89 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
 #endif
 
 KHASHL_SET_INIT(, kc_c4_t, kc_c4, uint64_t, kc_c4_hash, kc_c4_eq)
+
+// Simple uint64 hash set for tracking NGS k-mers already consumed by variant
+// paths or back-fill paths. Canonical k-mers (min of forward/reverse) are
+// stored. Uses a multiplicative hash over the full 64-bit key.
+#define u64_hashfn(x) ((khint_t)(((x) ^ ((x) >> 32)) * 2654435769u))
+#define u64_equalfn(a, b) ((a) == (b))
+KHASHL_SET_INIT(, u64set_t, u64set, uint64_t, u64_hashfn, u64_equalfn)
+
+static inline int u64set_contains(u64set_t *s, uint64_t key) {
+    if (s == NULL) return 0;
+    khint_t it = u64set_get(s, key);
+    return it != kh_end(s);
+}
+
+static inline void u64set_add(u64set_t *s, uint64_t key) {
+    if (s == NULL) return;
+    int absent;
+    u64set_put(s, key, &absent);
+}
+
+// ---------------------------------------------------------------------------
+// u64 -> u64 hash map used by the back-fill phase to resolve reference
+// positions for anchor k-mers, so that novel back-fill sequences can be
+// emitted as proper VCF records.
+//
+// Packed value layout for a reference-kmer position (64 bits):
+//   bit 63       : ambiguity flag. Set when the same canonical k-mer was
+//                  inserted more than once during indexing (repeat / palindrome).
+//                  Consumers must treat such entries as unresolved.
+//   bits 62..33  : contig index (30-bit unsigned).
+//   bit 32       : strand flag of the *first* insertion: 0 = forward k-mer
+//                  at that position equals the canonical form;
+//                  1 = reverse complement of k-mer at that position equals
+//                  the canonical form.
+//   bits 31..0   : 1-based position of the k-mer's leftmost base on the
+//                  forward strand of the contig.
+// ---------------------------------------------------------------------------
+#define u64map_hashfn(x) u64_hashfn(x)
+#define u64map_equalfn(a, b) u64_equalfn(a, b)
+KHASHL_MAP_INIT(, u64map_t, u64map, uint64_t, uint64_t, u64map_hashfn, u64map_equalfn)
+
+#define REFPOS_AMBIG_BIT   (1ULL << 63)
+#define REFPOS_STRAND_BIT  (1ULL << 32)
+#define REFPOS_POS_MASK    ((1ULL << 32) - 1ULL)
+#define REFPOS_CIDX_SHIFT  33
+#define REFPOS_CIDX_MASK   ((1ULL << 30) - 1ULL)
+
+static inline uint64_t refpos_encode(int contig_idx, uint32_t pos, int strand) {
+    return (((uint64_t)((uint32_t)contig_idx & REFPOS_CIDX_MASK)) << REFPOS_CIDX_SHIFT)
+         | (strand ? REFPOS_STRAND_BIT : 0ULL)
+         | ((uint64_t)pos & REFPOS_POS_MASK);
+}
+
+static inline void refpos_decode(uint64_t v, int *contig_idx, uint32_t *pos, int *strand) {
+    if (contig_idx) *contig_idx = (int)((v >> REFPOS_CIDX_SHIFT) & REFPOS_CIDX_MASK);
+    if (strand)     *strand     = (v & REFPOS_STRAND_BIT) ? 1 : 0;
+    if (pos)        *pos        = (uint32_t)(v & REFPOS_POS_MASK);
+}
+
+// Insert the first occurrence of a canonical k-mer, or mark an existing
+// entry as ambiguous if the canonical k-mer is encountered again.
+static inline void u64map_refpos_upsert(u64map_t *m, uint64_t can, uint64_t packed) {
+    if (m == NULL) return;
+    int absent;
+    khint_t it = u64map_put(m, can, &absent);
+    if (absent) {
+        kh_val(m, it) = packed;
+    } else {
+        kh_val(m, it) = kh_val(m, it) | REFPOS_AMBIG_BIT;
+    }
+}
+
+// Returns: 1 if unique (outputs populated), 0 if not present, -1 if ambiguous.
+static inline int u64map_refpos_lookup(u64map_t *m, uint64_t can,
+                                       int *contig_idx, uint32_t *pos, int *strand) {
+    if (m == NULL) return 0;
+    khint_t it = u64map_get(m, can);
+    if (it == kh_end(m)) return 0;
+    uint64_t v = kh_val(m, it);
+    if (v & REFPOS_AMBIG_BIT) return -1;
+    refpos_decode(v, contig_idx, pos, strand);
+    return 1;
+}
 
 #define CALLOC(ptr, len) do { \
     (ptr) = (__typeof__(ptr))calloc((len), sizeof(*(ptr))); \
@@ -316,13 +401,18 @@ static kc_c4x_t *count_file2(const char *fn, kc_c4x_t *hh, int k, int p, int blo
 
 int kmer_cov(uint64_t kmer, uint64_t mask, kc_c4x_t *h){
 
-    int j, x, cov=0, a_key;
+    int j, cov=0;
+    khint_t x;
+    uint64_t a_key;
     uint64_t hash_key = hash64(kmer, mask);
     j = hash_key & ((1<<KC_BITS) - 1);
     if(kh_size(h->h[j]) < 1){return 0;}
 
     hash_key = hash_key >> KC_BITS<< KC_BITS;
     x = kc_c4_get(h->h[j], hash_key);
+    if (x == kh_end(h->h[j])) {
+        return 0;
+    }
 
     if(kh_exist(h->h[j], x)){
         a_key = kh_key(h->h[j], x); 
@@ -413,10 +503,10 @@ typedef struct {
 
 // Add new struct for variations
 typedef struct {
-    char chrom[100];
+    char *chrom;
     int pos;
-    char ref[1000];
-    char alt[1000];
+    char *ref;
+    char *alt;
     char type[10];
 } variation_t;
 
@@ -440,6 +530,7 @@ typedef struct { // data structure for file evaluation
     int max_assem_cov; // Added max assembly coverage
 
     uint64_t *kms;
+    int kms_count;
     int k;
     int p;
     var_location *var_locs;
@@ -454,11 +545,111 @@ typedef struct { // data structure for file evaluation
     path_node **good_term_nodes;
     FILE *low_quality_fp;  // Moved from static for proper lifecycle management
     int extent_recursion_depth;  // Moved from static for thread safety
+
+    // Back-fill (unique NGS k-mer analysis) state
+    u64set_t *used_kmers;    // canonical NGS k-mers that are "anchor-eligible":
+                             //   * consumed by an accepted variant-calling path, or
+                             //   * lying on an accepted back-fill novel path.
+                             // These are the only non-reference k-mers that may
+                             // serve as anchors for a back-fill greedy walk.
+    u64set_t *contam_kmers;  // canonical NGS k-mers flagged as contamination by a
+                             // previous back-fill attempt. Kept separate so they
+                             // are NOT treated as anchors, but still skipped to
+                             // avoid redundant re-analysis within an iteration.
+    int backfill_max_ext;    // maximum extension length (in k-mer steps) per side
+    int backfill_min_cov;    // minimal NGS coverage during greedy walk
+    int n_backfill_novel;    // stats: novel paths found this iteration
+    int n_backfill_contam;   // stats: contamination k-mers this iteration
+    int n_backfill_unique;   // stats: total NGS-unique k-mers considered
+    int n_backfill_vcf;      // stats: novel paths successfully emitted as VCF records
 } evaluation_t;
+
+static char *pgf_strndup(const char *src, size_t len)
+{
+    char *dst = malloc(len + 1);
+    if (dst == NULL) {
+        fprintf(stderr, "Error: malloc failed at %s:%d\n", __FILE__, __LINE__);
+        exit(1);
+    }
+    if (len > 0) memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static void free_variations(evaluation_t *eva)
+{
+    if (eva == NULL || eva->variations == NULL) return;
+    for (int i = 0; i < eva->var_count; i++) {
+        free(eva->variations[i].chrom);
+        free(eva->variations[i].ref);
+        free(eva->variations[i].alt);
+    }
+    free(eva->variations);
+    eva->variations = NULL;
+    eva->var_count = 0;
+    eva->var_capacity = 0;
+}
+
+static int record_variation(evaluation_t *eva, const char *chrom, int pos,
+                            const char *ref, size_t ref_len,
+                            const char *alt, size_t alt_len,
+                            const char *type)
+{
+    if (eva == NULL || chrom == NULL || ref == NULL || alt == NULL || type == NULL) return 0;
+    if (pos <= 0) return 0;
+    size_t span_len = ref_len > 0 ? ref_len : 1;
+    if ((size_t)pos > (size_t)INT_MAX - span_len + 1) return 0;
+    int end = pos + (int)span_len - 1;
+
+    for (int i = 0; i < eva->var_count; i++) {
+        variation_t *old = &eva->variations[i];
+        if (old->chrom == NULL || old->ref == NULL || old->alt == NULL) continue;
+        if (strcmp(old->chrom, chrom) != 0) continue;
+        if (old->pos == pos &&
+            strcmp(old->type, type) == 0 &&
+            strlen(old->ref) == ref_len &&
+            strlen(old->alt) == alt_len &&
+            memcmp(old->ref, ref, ref_len) == 0 &&
+            memcmp(old->alt, alt, alt_len) == 0) {
+            return 0;
+        }
+        size_t old_span_len = strlen(old->ref);
+        if (old_span_len == 0) old_span_len = 1;
+        int old_end = old->pos + (int)old_span_len - 1;
+        if (pos <= old_end && old->pos <= end) {
+            return 0;
+        }
+    }
+
+    if (eva->var_count >= eva->var_capacity) {
+        eva->var_capacity = eva->var_capacity ? eva->var_capacity * 2 : 10;
+        REALLOC(eva->variations, eva->var_capacity);
+    }
+
+    variation_t *var = &eva->variations[eva->var_count++];
+    memset(var, 0, sizeof(*var));
+    var->chrom = pgf_strndup(chrom, strlen(chrom));
+    var->pos = pos;
+    var->ref = pgf_strndup(ref, ref_len);
+    var->alt = pgf_strndup(alt, alt_len);
+    strncpy(var->type, type, sizeof(var->type) - 1);
+    var->type[sizeof(var->type) - 1] = '\0';
+    return 1;
+}
+
+static int varcall_vcf_pos(const var_location *ref_var, int k, const char *var_type)
+{
+    if (ref_var == NULL || var_type == NULL) return 0;
+    (void)var_type;
+    return ref_var->pos_s + k + 1;
+}
 
 // Forward declarations to avoid implicit declaration warnings for functions used before definition
 int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int assem_min_cov, int dis);
 int best_term_node(evaluation_t *eva, int ref_node_num, int good_term_node_num);
+
+// Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
+static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path);
 
 
 
@@ -558,7 +749,13 @@ static void print_hist(const kc_c4x_t *h, int n_thread, const char *output_base)
 int compare_variations(const void *a, const void *b) {
     const variation_t *va = (const variation_t *)a;
     const variation_t *vb = (const variation_t *)b;
-    return vb->pos - va->pos; // Sort descending by position
+    const char *ca = va->chrom ? va->chrom : "";
+    const char *cb = vb->chrom ? vb->chrom : "";
+    int chrom_cmp = strcmp(ca, cb);
+    if (chrom_cmp != 0) return chrom_cmp;
+    if (vb->pos > va->pos) return 1;
+    if (vb->pos < va->pos) return -1;
+    return 0;
 }
 
 int path_node_num(path_node *term_node){
@@ -727,6 +924,14 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
 
     int path_cov = nodes_path_cov(eva, eva->good_term_nodes[path_index]);
 
+    // Record every canonical k-mer along the chosen variant path as "used"
+    // so the back-fill phase will not re-analyze them.
+    if (eva->used_kmers != NULL) {
+        for (int pi = 0; pi < path_nodes_num; pi++) {
+            u64set_add(eva->used_kmers, min_hash_key(path_kms[pi], k));
+        }
+    }
+
     unsigned char *ref_seq;
     int ref_seq_len = ref_var.pos_t - ref_var.pos_s - k + 2;
     CALLOC(ref_seq, ref_seq_len + 10);
@@ -735,23 +940,13 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
     int slim_path_len = seq_var.pos_t - seq_var.pos_s - k + 2; 
     CALLOC(path_seq, slim_path_len + 500);
 
-    fprintf(eva->vcf_out, "%s\t",eva->var_locs[var_loc_p].name);
     char info_field[200];
     char var_type[4];
 
     if(slim_path_len >= ref_seq_len){
         kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
         kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k + 1); 
-        fprintf(eva->vcf_out, ".\t"); // ID
-        fprintf(eva->vcf_out, "%s\t", ref_seq);
-        fprintf(eva->vcf_out, "%s\t", path_seq);
-        fprintf(eva->vcf_out, ".\t"); // QUAL
-        fprintf(eva->vcf_out, "PASS\t"); // FILTER
         if(slim_path_len > ref_seq_len){strcpy(var_type, "INS"); }else{strcpy(var_type, "SUB"); }
-        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
-        fprintf(eva->vcf_out, "%s", info_field);
-
     }
     if(slim_path_len < ref_seq_len){ // Deletion
         if(slim_path_len < 0){
@@ -761,48 +956,33 @@ int output_path(evaluation_t *eva, int var_loc_p, int path_index){
             kms_to_seq(ref_seq, eva->kms, ref_var.pos_s+1, ref_var.pos_t - k  );
             kms_to_seq(path_seq, path_kms, seq_var.pos_s+1, seq_var.pos_t - k  );
         }
-        fprintf(eva->vcf_out, "%d\t", ref_var.pos_s + k ); // POS for DEL is 1-based pos before deletion
+        strcpy(var_type, "DEL");
+    }
+    int vcf_pos = varcall_vcf_pos(&ref_var, k, var_type);
+    int is_new_variant = record_variation(eva, eva->var_locs[var_loc_p].name, vcf_pos,
+                                          (const char *)ref_seq, strlen((const char *)ref_seq),
+                                          (const char *)path_seq, strlen((const char *)path_seq),
+                                          var_type);
+    if (is_new_variant) {
+        fprintf(eva->vcf_out, "%s\t", eva->var_locs[var_loc_p].name);
+        fprintf(eva->vcf_out, "%d\t", vcf_pos);
         fprintf(eva->vcf_out, ".\t"); // ID
-        fprintf(eva->vcf_out, "%s\t", ref_seq); // REF
-        fprintf(eva->vcf_out, "%s\t", path_seq); // ALT (should be the base before deletion if ALT is single base)
+        fprintf(eva->vcf_out, "%s\t", ref_seq);
+        fprintf(eva->vcf_out, "%s\t", path_seq);
         fprintf(eva->vcf_out, ".\t"); // QUAL
         fprintf(eva->vcf_out, "PASS\t"); // FILTER
-        strcpy(var_type, "DEL");
-        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s", path_cov, var_type);
-        fprintf(eva->vcf_out, "%s", info_field);
+        snprintf(info_field, sizeof(info_field), "KMER_COV=%d;VARTYPE=%s;SOURCE=VARCALL", path_cov, var_type);
+        fprintf(eva->vcf_out, "%s\n", info_field);
     }
-    fprintf(eva->vcf_out, "\n");
     
     // fprintf(stdout, "##### ref_var.pos_s: %d \t", ref_var.pos_s);
     // fprintf(stdout, " ref_var.pos_t: %d \t", ref_var.pos_t);
     // fprintf(stdout, " new_var start_pos: %d \t", seq_var.pos_s);
     // fprintf(stdout, " new_var term_pos: %d \n\n\n\n\n", seq_var.pos_t);
 
-    if (eva->fix_enabled) {
-        if (eva->var_count >= eva->var_capacity) {
-            eva->var_capacity = eva->var_capacity ? eva->var_capacity * 2 : 10;
-            eva->variations = realloc(eva->variations, eva->var_capacity * sizeof(variation_t));
-        }
-        variation_t *var = &eva->variations[eva->var_count++];
-        strncpy(var->chrom, eva->var_locs[var_loc_p].name, sizeof(var->chrom));
-        var->chrom[sizeof(var->chrom)-1] = '\0';
-        
-        // Calculate genomic position based on k-mer start and k size
-        var->pos = ref_var.pos_s + eva->k + 1; // 1-based end position of k-mer
-        
-        strncpy(var->ref, (const char*)ref_seq, sizeof(var->ref));
-        var->ref[sizeof(var->ref)-1] = '\0';
-        strncpy(var->alt, (const char*)path_seq, sizeof(var->alt));
-        var->alt[sizeof(var->alt)-1] = '\0';
-        
-        if(slim_path_len > ref_seq_len) {
-            strcpy(var->type, "INS");
-        } else if(slim_path_len < ref_seq_len) {
-            strcpy(var->type, "DEL");
-        } else {
-            strcpy(var->type, "SUB");
-        }
-    }
+    free(path_kms);
+    free(ref_seq);
+    free(path_seq);
     return 0;
 }
 
@@ -1059,6 +1239,10 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
         fprintf(stderr, "Error: Invalid parameters\n");
         return 0;
     }
+    if (eva->kms_count <= 0) {
+        fprintf(stderr, "Error: Invalid k-mer array size\n");
+        return 0;
+    }
     
     int k = eva->k;
     uint64_t mask = (1ULL<<k*2) - 1;
@@ -1078,8 +1262,9 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     }
     
     var_loc->pos_t = var_loc->pos_t + dis;
-    // We don't know the upper bound without knowing the size of kms array
-    // So we'll rely on the cov check to prevent going too far
+    if (var_loc->pos_t >= eva->kms_count) {
+        var_loc->pos_t = eva->kms_count - 1;
+    }
     
     int cov_s = kmer_cov(min_hash_key(kms[var_loc->pos_s], k), mask, eva->h);
     int cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
@@ -1098,7 +1283,7 @@ int extent_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, int 
     itt = 0;
     // We need to limit how far we can extend to avoid going out of bounds
     int max_extension = MAX_EXTENT_DISTANCE;
-    while (cov_t <= assem_min_cov && itt < dis && itt < max_extension) {
+    while (cov_t <= assem_min_cov && itt < dis && itt < max_extension && var_loc->pos_t < eva->kms_count - 1) {
         var_loc->pos_t = var_loc->pos_t + 1;
         cov_t = kmer_cov(min_hash_key(kms[var_loc->pos_t], k), mask, eva->h);
         itt = itt + 1;
@@ -1154,6 +1339,39 @@ int optimize_var_loc(evaluation_t *eva, uint64_t *kms, var_location *var_loc, in
     return 1;
 } 
 
+static int append_var_location(evaluation_t *eva, var_location *var_locs, int *var_loc_num,
+                               int var_loc_capacity, uint64_t *kms, int pos_s, int pos_t,
+                               int term_cov, uint64_t mask, const char *seq_name)
+{
+    int k = eva->k;
+
+    if (pos_s < 0 || pos_t <= pos_s || pos_t >= eva->kms_count) return 0;
+    if (pos_t - pos_s <= k) return 0;
+
+    if (*var_loc_num >= var_loc_capacity) {
+        fprintf(stderr, "Warning: variation-location buffer is full; skipping remaining locations\n");
+        return -1;
+    }
+
+    int rep_km_num = kmer_cov(min_hash_key(kms[pos_t], k), mask, eva->hr);
+    int s_km_cov = kmer_cov(min_hash_key(kms[pos_s], k), mask, eva->h);
+
+    if (rep_km_num >= MAX_REP_KM_NUM) return 0;
+    if (term_cov <= 0 || (long long)s_km_cov > (long long)term_cov * MAX_COV_RATIO) return 0;
+
+    var_location *loc = &var_locs[*var_loc_num];
+    loc->kmer_s = kms[pos_s];
+    loc->pos_s = pos_s;
+    loc->kmer_t = kms[pos_t];
+    loc->pos_t = pos_t;
+
+    strncpy(loc->name, seq_name, sizeof(loc->name) - 1);
+    loc->name[sizeof(loc->name) - 1] = '\0';
+
+    (*var_loc_num)++;
+    return 1;
+}
+
 // Search for locations with variations
 static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max_len, int min_cov, int assem_min_cov)
 {
@@ -1186,50 +1404,48 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         // Allocate memory for this sequence
         MALLOC(kms, l); 
         km_num = seq_kmers(kms, k, l, pl.ks->seq.s);
+        eva->kms = kms;
+        eva->kms_count = km_num;
         
         MALLOC(var_locs, (l-k + 1));
         
         // Reset variation locations counter for this sequence
         int var_loc_num = 0;
-        var_location one_var_loc;
-        one_var_loc.kmer_s = 0;
-        one_var_loc.pos_s = -1;
+        int last_anchor_pos = -1;
+        int open_var_pos_s = -1;
+        int in_low_cov_run = 0;
+        int low_cov_kmers = 0;
+        // -c opens low-coverage candidates; -a closes them with assembly-usable anchors.
+        int anchor_min_cov = assem_min_cov > 0 ? assem_min_cov : min_cov;
         
         // Find variation locations for this sequence
         int j = 0;
         while(j < km_num) {
             int cov = kmer_cov(min_hash_key(kms[j],k), mask, eva->h);
-            
-            if(cov < min_cov) { // k-mer NOT present 
-                if(one_var_loc.pos_s < 0 && j > k) {
-                    one_var_loc.kmer_s = kms[j-1];
-                    one_var_loc.pos_s = j - 1;
-                }
-            } else { // k-mer present
-                if(one_var_loc.pos_s > 0) {
-                    int rep_km_num = kmer_cov(min_hash_key(kms[j],k), mask, eva->hr); 
-                    int s_km_cov = kmer_cov(min_hash_key(one_var_loc.kmer_s,k), mask, eva->h);
-                    
-                    if(rep_km_num < MAX_REP_KM_NUM && (cov > 0 && s_km_cov/cov <= MAX_COV_RATIO)) {
-                        var_locs[var_loc_num].kmer_s = one_var_loc.kmer_s;
-                        var_locs[var_loc_num].pos_s = one_var_loc.pos_s;
-                        var_locs[var_loc_num].kmer_t = kms[j];
-                        var_locs[var_loc_num].pos_t = j;
-                        
-                        strncpy(var_locs[var_loc_num].name, pl.ks->name.s, sizeof(var_locs[var_loc_num].name)-1);
-                        var_locs[var_loc_num].name[sizeof(var_locs[var_loc_num].name)-1] = '\0';
-                        
-                        if(var_locs[var_loc_num].pos_t - var_locs[var_loc_num].pos_s <= k) {
-                            var_locs[var_loc_num].pos_t = var_locs[var_loc_num].pos_s + k + 1;
-                            var_locs[var_loc_num].kmer_t = kms[var_locs[var_loc_num].pos_t];
-                        }
-                        
-                        one_var_loc.kmer_s = 0;
-                        one_var_loc.pos_s = -1;
-                        var_loc_num++;
-                    }
+            int is_low_cov = cov < min_cov;
+            int is_anchor = cov >= anchor_min_cov;
+            int starts_low_cov_run = is_low_cov && !in_low_cov_run;
+
+            if (is_low_cov) low_cov_kmers++;
+
+            if (open_var_pos_s >= 0 && is_anchor) {
+                int added = append_var_location(eva, var_locs, &var_loc_num, km_num, kms,
+                                                open_var_pos_s, j, cov, mask, pl.ks->name.s);
+                if (added < 0) break;
+                if (added > 0) {
+                    open_var_pos_s = -1;
+                    last_anchor_pos = j;
                 }
             }
+
+            if (open_var_pos_s < 0) {
+                if (starts_low_cov_run && last_anchor_pos >= 0 && last_anchor_pos < j && j > k) {
+                    open_var_pos_s = last_anchor_pos;
+                } else if (is_anchor) {
+                    last_anchor_pos = j;
+                }
+            }
+            in_low_cov_run = is_low_cov;
             j++;
         }
         
@@ -1237,7 +1453,9 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         eva->var_locs = var_locs;
         eva->kms = kms;
         
-        fprintf(stderr, "Found %d variation locations in sequence: %s\n", var_loc_num, pl.ks->name.s);
+        fprintf(stderr,
+                "Found %d variation locations in sequence: %s (low-coverage k-mers: %d, region min: %d, anchor min: %d)\n",
+                var_loc_num, pl.ks->name.s, low_cov_kmers, min_cov, anchor_min_cov);
         
 
 
@@ -1254,6 +1472,7 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
         free(kms);
         free(var_locs);
         eva->kms = NULL;
+        eva->kms_count = 0;
         eva->var_locs = NULL;
     }
 
@@ -1263,22 +1482,82 @@ static evaluation_t *analysis_ref_seq(evaluation_t *eva, const char *fn, int max
     return eva;
 }
 
+static int apply_variation_to_sequence(char **sequence, int *len,
+                                       const char *seqname, const variation_t *var)
+{
+    if (sequence == NULL || *sequence == NULL || len == NULL || var == NULL ||
+        var->ref == NULL || var->alt == NULL) {
+        return 0;
+    }
+
+    size_t ref_len = strlen(var->ref);
+    size_t alt_len = strlen(var->alt);
+    int pos = var->pos - 1; // Convert to 0-based.
+
+    if (pos < 0 || pos > *len) {
+        fprintf(stderr, "  Skip: Position %d out of bounds for sequence %s (length: %d)\n",
+                var->pos, seqname, *len);
+        return 0;
+    }
+    if ((size_t)pos + ref_len > (size_t)*len) {
+        fprintf(stderr, "  Skip: Reference length exceeds sequence bounds at %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+    if (ref_len > 0 && strncmp(*sequence + pos, var->ref, ref_len) != 0) {
+        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
+        fprintf(stderr, "    Expected: '%s'\n", var->ref);
+        fprintf(stderr, "    Found: '%.10s'\n", *sequence + pos);
+        return 0;
+    }
+
+    size_t new_len = (size_t)*len - ref_len + alt_len;
+    if (new_len > (size_t)INT_MAX) {
+        fprintf(stderr, "  Skip: Edited sequence would exceed supported length at %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+
+    if (ref_len == alt_len) {
+        if (alt_len > 0) memcpy(*sequence + pos, var->alt, alt_len);
+        return 1;
+    }
+
+    char *new_seq = malloc(new_len + 1);
+    if (!new_seq) {
+        fprintf(stderr, "  Error: Memory allocation failed while applying %s:%d\n",
+                seqname, var->pos);
+        return 0;
+    }
+
+    memcpy(new_seq, *sequence, (size_t)pos);
+    if (alt_len > 0) memcpy(new_seq + pos, var->alt, alt_len);
+    memcpy(new_seq + pos + alt_len, *sequence + pos + ref_len,
+           (size_t)*len - (size_t)pos - ref_len);
+    new_seq[new_len] = '\0';
+
+    free(*sequence);
+    *sequence = new_seq;
+    *len = (int)new_len;
+    return 1;
+}
+
 // Complete the apply_variations function to include INS and DEL handling
 void apply_variations(evaluation_t *eva, const char *ref_file, const char *output_base) {
-    char *output_fn = strdup(output_base);
-    
+    if (eva == NULL || ref_file == NULL || output_base == NULL) return;
+
     gzFile fp = gzopen(ref_file, "r");
     if (!fp) {
         fprintf(stderr, "Failed to open reference file %s\n", ref_file);
-        free(output_fn);
         return;
     }
 
     kseq_t *seq = kseq_init(fp);
-    FILE *out_fp = fopen(output_fn, "w");
+    FILE *out_fp = fopen(output_base, "w");
     if (!out_fp) {
-        fprintf(stderr, "Failed to open output file %s\n", output_fn);
-        free(output_fn);
+        fprintf(stderr, "Failed to open output file %s\n", output_base);
+        kseq_destroy(seq);
+        gzclose(fp);
         return;
     }
 
@@ -1291,6 +1570,10 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
         char *seqname = seq->name.s;
         char *sequence = strdup(seq->seq.s);
         int len = seq->seq.l;
+        if (sequence == NULL) {
+            fprintf(stderr, "Failed to allocate sequence buffer for %s\n", seqname);
+            continue;
+        }
         
         fprintf(stderr, "Processing sequence: %s (length: %d)\n", seqname, len);
         
@@ -1299,7 +1582,8 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
         variation_t *seq_variations = NULL;
         
         for (int i = 0; i < eva->var_count; i++) {
-            if (strcmp(eva->variations[i].chrom, seqname) == 0) {
+            if (eva->variations[i].chrom != NULL &&
+                strcmp(eva->variations[i].chrom, seqname) == 0) {
                 seq_var_count++;
             }
         }
@@ -1310,7 +1594,8 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
             int j = 0;
             
             for (int i = 0; i < eva->var_count; i++) {
-                if (strcmp(eva->variations[i].chrom, seqname) == 0) {
+                if (eva->variations[i].chrom != NULL &&
+                    strcmp(eva->variations[i].chrom, seqname) == 0) {
                     seq_variations[j++] = eva->variations[i];
                 }
             }
@@ -1321,103 +1606,7 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
             // Apply variations to this sequence
             for (int i = 0; i < seq_var_count; i++) {
                 variation_t *var = &seq_variations[i];
-                int pos = var->pos - 1; // Convert to 0-based
-                
-                if (pos < 0 || pos >= len) {
-                    fprintf(stderr, "  Skip: Position %d out of bounds for sequence %s (length: %d)\n", 
-                            var->pos, seqname, len);
-                    continue;
-                }
-
-                // Debug output before applying variation
-                // fprintf(stderr, "Applying variation at position %d:\n", var->pos);
-                // fprintf(stderr, "  Type: %s\n", var->type);
-                // fprintf(stderr, "  REF: '%s'\n", var->ref);
-                // fprintf(stderr, "  ALT: '%s'\n", var->alt);
-                // fprintf(stderr, "  Current sequence at position: '%.10s'\n", &sequence[pos]);
-
-                if (strcmp(var->type, "SUB") == 0) {
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    if (pos + ref_len > len) {
-                        fprintf(stderr, "  Skip: Reference length exceeds sequence bounds\n");
-                        continue;
-                    }
-                    if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                        fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                        fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                        continue;
-                    }
-                    // Replace REF with ALT
-                    memcpy(&sequence[pos], var->alt, alt_len);
-                    // fprintf(stderr, "  After substitution: '%.10s'\n", &sequence[pos]);
-                } else if (strcmp(var->type, "INS") == 0) {
-                    // Insert ALT after POS (VCF format)
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    int ins_len = alt_len - ref_len;  // True insertion length
-                    
-                    // Check for REF mismatch if REF has content
-                    if (ref_len > 0) {
-                        if (pos + ref_len > len) {
-                            fprintf(stderr, "  Skip: Reference length exceeds sequence bounds\n");
-                            continue;
-                        }
-                        if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                            fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                            fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                            fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                            continue;
-                        }
-                    }
-                    
-                    // For insertions, we need to allocate more space
-                    char *new_seq = malloc(len + ins_len + 1);
-                    if (!new_seq) {
-                        fprintf(stderr, "  Error: Memory allocation failed for insertion\n");
-                        continue;
-                    }
-                    
-                    // Copy sequence up to the insertion point
-                    memcpy(new_seq, sequence, pos + ref_len);
-                    // Insert ALT (which includes the REF part)
-                    memcpy(new_seq + pos, var->alt, alt_len);
-                    // Copy the remainder of the sequence
-                    memcpy(new_seq + pos + alt_len, sequence + pos + ref_len, len - pos - ref_len);
-                    // Null terminate
-                    new_seq[len + ins_len] = '\0';
-                    
-                    // Clean up and update
-                    free(sequence);
-                    sequence = new_seq;
-                    len += ins_len;
-                    
-                    // fprintf(stderr, "  After insertion: '%.10s'\n", &sequence[pos]);
-                } else if (strcmp(var->type, "DEL") == 0) {
-                    int ref_len = strlen(var->ref);
-                    int alt_len = strlen(var->alt);
-                    int del_len = ref_len - alt_len;
-                    
-                    if (pos + ref_len > len || del_len <= 0) {
-                        fprintf(stderr, "  Skip: Invalid deletion parameters\n");
-                        continue;
-                    }
-                    
-                    if (strncmp(&sequence[pos], var->ref, ref_len) != 0) {
-                        fprintf(stderr, "  REF mismatch at %s:%d\n", seqname, var->pos);
-                        fprintf(stderr, "    Expected: '%s'\n", var->ref);
-                        fprintf(stderr, "    Found: '%.10s'\n", &sequence[pos]);
-                        continue;
-                    }
-                    
-                    // Replace with ALT and delete remaining bases
-                    memcpy(&sequence[pos], var->alt, alt_len);
-                    memmove(&sequence[pos + alt_len], &sequence[pos + ref_len], len - pos - ref_len + 1); // +1 for null terminator
-                    len -= del_len;
-                    
-                    // fprintf(stderr, "  After deletion: '%.10s'\n", &sequence[pos]);
-                }
+                apply_variation_to_sequence(&sequence, &len, seqname, var);
             }
             
             // Free sequence-specific variations
@@ -1432,13 +1621,583 @@ void apply_variations(evaluation_t *eva, const char *ref_file, const char *outpu
     kseq_destroy(seq);
     gzclose(fp);
     fclose(out_fp);
-    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_fn);
-    free(output_fn);
+    fprintf(stderr, "Successfully wrote corrected genome to %s\n", output_base);
 }
 
 
 
 
+
+// ===================================================================
+// Reference-position index used to translate back-fill anchor k-mers into
+// VCF CHROM/POS/REF. Built once at the start of each back-fill invocation
+// by re-reading the current reference FASTA.
+// ===================================================================
+typedef struct {
+    u64map_t *kpos;              // canonical k-mer -> encoded (contig,pos,strand) or ambiguous
+    char **contig_names;         // contig display names (NUL-terminated)
+    unsigned char **contig_seqs; // contig sequences, uppercase ACGT/N, 0-based
+    uint32_t *contig_lens;       // sequence lengths
+    int n_contigs;
+    int k;
+} ref_pos_ctx_t;
+
+static void ref_pos_ctx_free(ref_pos_ctx_t *ctx) {
+    if (ctx == NULL) return;
+    if (ctx->kpos) u64map_destroy(ctx->kpos);
+    if (ctx->contig_names) {
+        for (int i = 0; i < ctx->n_contigs; i++) free(ctx->contig_names[i]);
+        free(ctx->contig_names);
+    }
+    if (ctx->contig_seqs) {
+        for (int i = 0; i < ctx->n_contigs; i++) free(ctx->contig_seqs[i]);
+        free(ctx->contig_seqs);
+    }
+    if (ctx->contig_lens) free(ctx->contig_lens);
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+// Re-read the reference FASTA and build a canonical-kmer -> position map
+// plus per-contig sequence copies. Returns 0 on success, -1 on failure.
+static int ref_pos_ctx_build(const char *path, int k, ref_pos_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->k = k;
+    gzFile fp = gzopen(path, "r");
+    if (fp == NULL) return -1;
+    kseq_t *seq = kseq_init(fp);
+    ctx->kpos = u64map_init();
+    if (ctx->kpos == NULL) { kseq_destroy(seq); gzclose(fp); return -1; }
+
+    int cap = 0;
+    int l;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    while ((l = kseq_read(seq)) >= 0) {
+        if (l < k) continue;
+        if (ctx->n_contigs >= cap) {
+            cap = cap ? cap * 2 : 16;
+            char **nn = realloc(ctx->contig_names, (size_t)cap * sizeof(char *));
+            unsigned char **ns = realloc(ctx->contig_seqs, (size_t)cap * sizeof(unsigned char *));
+            uint32_t *nl = realloc(ctx->contig_lens, (size_t)cap * sizeof(uint32_t));
+            if (!nn || !ns || !nl) {
+                free(nn); free(ns); free(nl);
+                kseq_destroy(seq); gzclose(fp);
+                ref_pos_ctx_free(ctx);
+                return -1;
+            }
+            ctx->contig_names = nn;
+            ctx->contig_seqs  = ns;
+            ctx->contig_lens  = nl;
+        }
+        int cidx = ctx->n_contigs++;
+        ctx->contig_names[cidx] = strdup(seq->name.s ? seq->name.s : "");
+        ctx->contig_lens[cidx]  = (uint32_t)l;
+        unsigned char *s = malloc((size_t)l + 1);
+        if (s == NULL) { kseq_destroy(seq); gzclose(fp); ref_pos_ctx_free(ctx); return -1; }
+        for (int i = 0; i < l; i++) {
+            unsigned char c = (unsigned char)seq->seq.s[i];
+            if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+            s[i] = c;
+        }
+        s[l] = '\0';
+        ctx->contig_seqs[cidx] = s;
+
+        // Slide a k-mer window across the contig and index canonical forms.
+        uint64_t y = 0;
+        int len = 0;
+        for (int i = 0; i < l; i++) {
+            int c = seq_nt4_table[s[i]];
+            if (c >= 4) { y = 0; len = 0; continue; }
+            y = ((y << 2) | (uint64_t)c) & mask;
+            if (++len >= k) {
+                uint32_t pos = (uint32_t)(i - k + 2); // 1-based leftmost base
+                uint64_t can = min_hash_key(y, k);
+                int strand = (y == can) ? 0 : 1;
+                u64map_refpos_upsert(ctx->kpos, can, refpos_encode(cidx, pos, strand));
+            }
+        }
+    }
+    kseq_destroy(seq);
+    gzclose(fp);
+    return 0;
+}
+
+// Reverse-complement an ACGT string in place.
+static inline void acgt_revcomp_inplace(unsigned char *s, int n) {
+    static const unsigned char cmp[128] = {
+        ['A']='T', ['C']='G', ['G']='C', ['T']='A', ['N']='N',
+        ['a']='t', ['c']='g', ['g']='c', ['t']='a', ['n']='n'
+    };
+    for (int i = 0, j = n - 1; i < j; i++, j--) {
+        unsigned char a = s[i], b = s[j];
+        s[i] = cmp[b] ? cmp[b] : 'N';
+        s[j] = cmp[a] ? cmp[a] : 'N';
+    }
+    if ((n & 1) == 1) {
+        int m = n / 2;
+        s[m] = cmp[s[m]] ? cmp[s[m]] : 'N';
+    }
+}
+
+// Emit one back-fill novel sequence as a VCF record (SOURCE=BACKFILL) when
+// both anchors resolve uniquely onto the same contig with consistent strand.
+// Returns 1 if a record was written, 0 otherwise.
+//   left_anchor_can / right_anchor_can : canonical forms of the two anchors.
+//   left_walk_fwd / right_walk_fwd     : fwd encodings (walk orientation) of
+//                                        left_path[lpl-1] and right_path[rpl-1].
+//   assembled_seq  : NUL-terminated ACGT string, length == seq_len == k+lpl+rpl.
+static int emit_backfill_vcf(evaluation_t *eva, ref_pos_ctx_t *ctx,
+                             uint64_t left_anchor_can, uint64_t left_walk_fwd,
+                             uint64_t right_anchor_can, uint64_t right_walk_fwd,
+                             const unsigned char *assembled_seq, int seq_len,
+                             int path_cov)
+{
+    if (eva == NULL || eva->vcf_out == NULL || ctx == NULL || ctx->kpos == NULL) return 0;
+    int k = eva->k;
+
+    int l_cidx = 0, r_cidx = 0, l_strand = 0, r_strand = 0;
+    uint32_t l_pos = 0, r_pos = 0;
+    int l_ok = u64map_refpos_lookup(ctx->kpos, left_anchor_can, &l_cidx, &l_pos, &l_strand);
+    int r_ok = u64map_refpos_lookup(ctx->kpos, right_anchor_can, &r_cidx, &r_pos, &r_strand);
+    if (l_ok != 1 || r_ok != 1) return 0;           // unknown or ambiguous
+    if (l_cidx != r_cidx) return 0;                  // anchors on different contigs
+    if (left_anchor_can == right_anchor_can) return 0; // self-loop / palindrome
+
+    // Determine whether the walk orientation matches the reference forward strand.
+    // For the left anchor: walk_matches_ref_fwd <=> (left_walk_fwd == left_anchor_can) XOR (l_strand == 1) == 0.
+    int left_walk_is_can  = (left_walk_fwd  == left_anchor_can);
+    int right_walk_is_can = (right_walk_fwd == right_anchor_can);
+    int l_walk_on_fwd = (left_walk_is_can  ? (l_strand == 0) : (l_strand == 1));
+    int r_walk_on_fwd = (right_walk_is_can ? (r_strand == 0) : (r_strand == 1));
+    if (l_walk_on_fwd != r_walk_on_fwd) return 0;   // inconsistent strand
+
+    int on_fwd = l_walk_on_fwd;
+    uint32_t L_pos, R_pos;
+    if (on_fwd) { L_pos = l_pos; R_pos = r_pos; }
+    else        { L_pos = r_pos; R_pos = l_pos; }
+    if (R_pos <= L_pos) return 0;                   // inconsistent ordering
+
+    // Reference span [L_pos .. R_pos + k - 1] (1-based inclusive).
+    uint32_t contig_len = ctx->contig_lens[l_cidx];
+    if (R_pos + (uint32_t)k - 1 > contig_len) return 0;
+    int ref_span = (int)(R_pos - L_pos) + k;
+    if (ref_span < k || seq_len < k) return 0;
+
+    // Build REF and ALT strings.
+    unsigned char *REF = malloc((size_t)ref_span + 1);
+    unsigned char *ALT = malloc((size_t)seq_len + 1);
+    if (REF == NULL || ALT == NULL) { free(REF); free(ALT); return 0; }
+    memcpy(REF, ctx->contig_seqs[l_cidx] + (L_pos - 1), (size_t)ref_span);
+    REF[ref_span] = '\0';
+    memcpy(ALT, assembled_seq, (size_t)seq_len);
+    ALT[seq_len] = '\0';
+    if (!on_fwd) acgt_revcomp_inplace(ALT, seq_len);
+
+    // Sanity: first k chars of ALT must equal ref[L_pos..L_pos+k-1], and
+    // last k chars of ALT must equal ref[R_pos..R_pos+k-1]. Skip on mismatch.
+    if (memcmp(REF, ALT, (size_t)k) != 0 ||
+        memcmp(REF + ref_span - k, ALT + seq_len - k, (size_t)k) != 0) {
+        free(REF); free(ALT); return 0;
+    }
+
+    // Normalize: trim common suffix then common prefix, retaining >=1 base in both.
+    int r_len = ref_span;
+    int a_len = seq_len;
+    int head  = 0;
+    while (r_len > 1 && a_len > 1 && REF[r_len - 1] == ALT[a_len - 1]) { r_len--; a_len--; }
+    while (r_len > 1 && a_len > 1 && REF[head] == ALT[head])          { r_len--; a_len--; head++; }
+
+    if (r_len == a_len && memcmp(REF + head, ALT + head, (size_t)r_len) == 0) {
+        free(REF); free(ALT); return 0;
+    }
+    uint32_t vcf_pos = L_pos + (uint32_t)head;
+
+    const char *var_type = "SUB";
+    if (a_len > r_len)      var_type = "INS";
+    else if (a_len < r_len) var_type = "DEL";
+
+    if (vcf_pos > (uint32_t)INT_MAX ||
+        !record_variation(eva, ctx->contig_names[l_cidx], (int)vcf_pos,
+                          (const char *)REF + head, (size_t)r_len,
+                          (const char *)ALT + head, (size_t)a_len,
+                          var_type)) {
+        free(REF);
+        free(ALT);
+        return 0;
+    }
+
+    // Emit VCF record.
+    fprintf(eva->vcf_out, "%s\t%u\t.\t", ctx->contig_names[l_cidx], vcf_pos);
+    fwrite(REF + head, 1, (size_t)r_len, eva->vcf_out);
+    fprintf(eva->vcf_out, "\t");
+    fwrite(ALT + head, 1, (size_t)a_len, eva->vcf_out);
+    fprintf(eva->vcf_out, "\t.\tPASS\tKMER_COV=%d;VARTYPE=%s;SOURCE=BACKFILL\n",
+            path_cov, var_type);
+
+    free(REF);
+    free(ALT);
+    return 1;
+}
+
+// ===================================================================
+// Back-fill process: recover variation signals that the reference-anchored
+// variant caller did not consume. The set of candidate starting k-mers is
+// the intersection of three conditions:
+//   (1) canonical k-mer is present in NGS with coverage >= backfill_min_cov;
+//   (2) canonical k-mer is NOT present in the current reference;
+//   (3) canonical k-mer has NOT already been consumed by a previously
+//       accepted variant path or accepted back-fill path, and has NOT
+//       already been flagged as contamination earlier in this iteration.
+// Note: condition (3) is essential. Variant-calling path assembly does
+// consume non-reference k-mers (the alt-allele portion of a variant path),
+// so "present in NGS but missing from the reference" alone is NOT the
+// correct candidate set.
+//
+// For each candidate starting k-mer, search all coverage-qualified paths in
+// both directions on the NGS De Bruijn graph. An anchor is reached when the
+// walk meets (a) a reference k-mer, or (b) a k-mer already on an accepted
+// variant/back-fill path (i.e. an element of eva->used_kmers). A walk that
+// runs into a contamination-flagged k-mer (eva->contam_kmers) is NOT
+// considered anchored, because such a k-mer has already been shown to fail
+// the anchoring test. Paths that reach an anchor on both sides are reported
+// as novel sequences, and every k-mer along the accepted path is added to
+// used_kmers. Paths that fail to anchor on at least one side mark ONLY the
+// starting k-mer as contamination; intermediate k-mers on the failed walk
+// are left untouched so they can still be analyzed on their own merit.
+// ===================================================================
+
+typedef struct {
+    uint64_t kmer;
+    int parent;
+    int depth;
+    int terminal;
+} backfill_path_state_t;
+
+static int backfill_state_seen(backfill_path_state_t *states, int n, uint64_t kmer)
+{
+    for (int i = 0; i < n; i++) {
+        if (states[i].kmer == kmer) return 1;
+    }
+    return 0;
+}
+
+static void backfill_copy_path(backfill_path_state_t *states, int idx,
+                               uint64_t *path_out, int *path_len_out)
+{
+    int n = states[idx].depth;
+    *path_len_out = n;
+    for (int i = n - 1; i >= 0; i--) {
+        path_out[i] = states[idx].kmer;
+        idx = states[idx].parent;
+    }
+}
+
+// Bounded multi-path search on the NGS De Bruijn graph.
+//   direction = +1 : extend forward  (append base to 3' end of y)
+//   direction = -1 : extend backward (prepend base to 5' end of y)
+// Returns 1 when a reference k-mer anchor is reached (anchor_out set to
+// the canonical form of that anchor), 0 when max_len is hit without
+// anchor, -1 when a dead-end is reached.
+static int backfill_extend(evaluation_t *eva, uint64_t start_fwd, int direction,
+                           int min_cov, int max_len,
+                           uint64_t *path_out, int *path_len_out,
+                           uint64_t *anchor_out)
+{
+    int k = eva->k;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    uint64_t shift = (uint64_t)(k - 1) * 2;
+    backfill_path_state_t states[Max_Path_Num];
+    int head = 0;
+    int n_states = 1;
+    int saw_edge = 0;
+    int truncated = 0;
+    int fallback_idx = -1;
+    uint64_t fallback_anchor = 0;
+    int prefer_canonical_anchor = (start_fwd == min_hash_key(start_fwd, k));
+
+    *path_len_out = 0;
+    states[0].kmer = start_fwd;
+    states[0].parent = -1;
+    states[0].depth = 0;
+    states[0].terminal = 0;
+
+    while (head < n_states) {
+        backfill_path_state_t *cur = &states[head];
+        if (cur->terminal) {
+            head++;
+            continue;
+        }
+        if (cur->depth >= max_len) {
+            truncated = 1;
+            head++;
+            continue;
+        }
+        for (int b = 0; b < 4; b++) {
+            uint64_t nxt;
+            if (direction > 0) {
+                nxt = ((cur->kmer << 2) | (uint64_t)b) & mask;
+            } else {
+                nxt = (cur->kmer >> 2) | ((uint64_t)b << shift);
+            }
+            if (nxt == cur->kmer) continue; // homopolymer self-loop guard
+            uint64_t can = min_hash_key(nxt, k);
+            int cov = kmer_cov(can, mask, eva->h);
+            if (cov < min_cov) continue;
+            saw_edge = 1;
+            if (backfill_state_seen(states, n_states, nxt)) continue;
+            if (n_states >= Max_Path_Num) {
+                truncated = 1;
+                continue;
+            }
+
+            int next_idx = n_states++;
+            states[next_idx].kmer = nxt;
+            states[next_idx].parent = head;
+            states[next_idx].depth = cur->depth + 1;
+            states[next_idx].terminal = 0;
+
+            int is_anchor = 0;
+
+            // If this canonical k-mer is already on an accepted variant path or
+            // accepted back-fill novel path, treat it as a valid anchor so the
+            // novel region joins cleanly with known paths. Note: contamination
+            // k-mers are stored in eva->contam_kmers (NOT used_kmers) and must
+            // NOT satisfy this anchor condition.
+            if (u64set_contains(eva->used_kmers, can)) {
+                *anchor_out = can;
+                backfill_copy_path(states, next_idx, path_out, path_len_out);
+                return 1;
+            }
+
+            int rcov = kmer_cov(can, mask, eva->hr);
+            if (rcov > 0) {
+                uint64_t can_rc = comp_rev(can, k);
+                int palindrome = (can == can_rc);
+                int preferred = palindrome || ((nxt == can) == prefer_canonical_anchor);
+                is_anchor = 1;
+                if (preferred) {
+                    *anchor_out = can;
+                    backfill_copy_path(states, next_idx, path_out, path_len_out);
+                    return 1;
+                }
+                if (fallback_idx < 0) {
+                    fallback_idx = next_idx;
+                    fallback_anchor = can;
+                }
+            }
+            states[next_idx].terminal = is_anchor;
+        }
+        head++;
+    }
+    if (fallback_idx >= 0) {
+        *anchor_out = fallback_anchor;
+        backfill_copy_path(states, fallback_idx, path_out, path_len_out);
+        return 1;
+    }
+    return saw_edge || truncated ? 0 : -1;
+}
+
+static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path)
+{
+    if (eva == NULL || eva->h == NULL || eva->hr == NULL || eva->output_base == NULL) {
+        return;
+    }
+    if (eva->used_kmers == NULL) return;
+
+    int k = eva->k;
+    int p = eva->h->p;
+    uint64_t mask = (1ULL << (k * 2)) - 1;
+    int min_cov = eva->backfill_min_cov > 0 ? eva->backfill_min_cov : 2;
+    int max_ext = eva->backfill_max_ext > 0 ? eva->backfill_max_ext : 1000;
+
+    // Build a reference canonical-kmer -> position index so that novel
+    // back-fill sequences can be emitted as VCF records tagged SOURCE=BACKFILL.
+    // If the build fails, back-fill still proceeds but VCF emission is skipped.
+    ref_pos_ctx_t rpctx;
+    int rp_ok = 0;
+    if (ref_path != NULL && eva->vcf_out != NULL) {
+        if (ref_pos_ctx_build(ref_path, k, &rpctx) == 0) {
+            rp_ok = 1;
+        } else {
+            fprintf(stderr,
+                    "Warning: back-fill could not build reference position index from %s; "
+                    "VCF records for BACKFILL variants will be suppressed this iteration.\n",
+                    ref_path);
+        }
+    }
+
+    char novel_fn[512], contam_fn[512];
+    snprintf(novel_fn, sizeof(novel_fn), "%s.iter%d.novel.tsv",
+             eva->output_base, eva->iteration);
+    snprintf(contam_fn, sizeof(contam_fn), "%s.iter%d.contamination.tsv",
+             eva->output_base, eva->iteration);
+
+    FILE *novel_fp = fopen(novel_fn, "w");
+    FILE *contam_fp = fopen(contam_fn, "w");
+    if (novel_fp == NULL || contam_fp == NULL) {
+        fprintf(stderr, "Error: Could not open back-fill output files\n");
+        if (novel_fp) fclose(novel_fp);
+        if (contam_fp) fclose(contam_fp);
+        return;
+    }
+    fprintf(novel_fp, "#LEFT_ANCHOR\tRIGHT_ANCHOR\tSEQ_LEN\tSTART_KMER_COV\tSEQUENCE\n");
+    fprintf(contam_fp, "#KMER\tKMER_COV\tREASON\n");
+
+    uint64_t *left_path = NULL, *right_path = NULL;
+    MALLOC(left_path, max_ext + 2);
+    MALLOC(right_path, max_ext + 2);
+
+    eva->n_backfill_novel = 0;
+    eva->n_backfill_contam = 0;
+    eva->n_backfill_unique = 0;
+    eva->n_backfill_vcf = 0;
+
+    // Iterate every NGS k-mer bucket.
+    for (int bi = 0; bi < (1 << p); bi++) {
+        kc_c4_t *bucket = eva->h->h[bi];
+        if (bucket == NULL) continue;
+        for (khint_t it = 0; it != kh_end(bucket); it++) {
+            if (!kh_exist(bucket, it)) continue;
+            uint64_t stored = kh_key(bucket, it);
+            int cov = (int)(stored & KC_MAX);
+            if (cov < min_cov) continue;
+
+            // Reconstruct canonical k-mer: stored = (hash64(can) >> p) << KC_BITS
+            uint64_t hash_val = ((stored >> KC_BITS) << p) | (uint64_t)bi;
+            uint64_t y_can = hash64i(hash_val, mask);
+
+            // Skip k-mers that appear in the reference.
+            if (kmer_cov(y_can, mask, eva->hr) > 0) continue;
+
+            eva->n_backfill_unique++;
+
+            // Skip k-mers already consumed by a variant or previous accepted
+            // back-fill path (anchor-eligible), as well as k-mers already
+            // flagged as contamination within this iteration. The two sets
+            // are tracked separately because only used_kmers may act as
+            // anchors in backfill_extend; contam_kmers is merely a memo to
+            // avoid redundant re-analysis.
+            if (u64set_contains(eva->used_kmers, y_can)) continue;
+            if (eva->contam_kmers != NULL &&
+                u64set_contains(eva->contam_kmers, y_can)) continue;
+
+            // Try both strand orientations; keep the first that anchors on both sides.
+            uint64_t orientations[2];
+            orientations[0] = y_can;
+            orientations[1] = comp_rev(y_can, k);
+
+            int anchored = 0;
+            int lpl = 0, rpl = 0;
+            uint64_t left_anchor = 0, right_anchor = 0;
+            int r_left_last = -1, r_right_last = -1;
+            uint64_t used_y_fwd = y_can;
+
+            for (int o = 0; o < 2; o++) {
+                int tmp_lpl = 0, tmp_rpl = 0;
+                uint64_t tmp_la = 0, tmp_ra = 0;
+                int r_right = backfill_extend(eva, orientations[o], +1,
+                                              min_cov, max_ext,
+                                              right_path, &tmp_rpl, &tmp_ra);
+                int r_left = backfill_extend(eva, orientations[o], -1,
+                                             min_cov, max_ext,
+                                             left_path, &tmp_lpl, &tmp_la);
+                r_left_last = r_left;
+                r_right_last = r_right;
+                if (r_left == 1 && r_right == 1) {
+                    anchored = 1;
+                    lpl = tmp_lpl;
+                    rpl = tmp_rpl;
+                    left_anchor = tmp_la;
+                    right_anchor = tmp_ra;
+                    used_y_fwd = orientations[o];
+                    break;
+                }
+            }
+
+            if (anchored) {
+                // Assemble novel sequence: left_path is in extension order
+                // (closest to start at index 0, leftmost at index lpl-1).
+                int seq_len = k + lpl + rpl;
+                unsigned char *seq_buf = NULL;
+                CALLOC(seq_buf, seq_len + 1);
+
+                uint64_t leftmost = (lpl > 0) ? left_path[lpl - 1] : used_y_fwd;
+                uint64_acgt(leftmost, seq_buf, k);
+                int sp = k;
+                for (int ii = lpl - 2; ii >= 0; ii--) {
+                    seq_buf[sp++] = nt4_seq_table[left_path[ii] & 3ULL];
+                }
+                if (lpl > 0) {
+                    seq_buf[sp++] = nt4_seq_table[used_y_fwd & 3ULL];
+                }
+                for (int ii = 0; ii < rpl; ii++) {
+                    seq_buf[sp++] = nt4_seq_table[right_path[ii] & 3ULL];
+                }
+                seq_buf[sp] = '\0';
+
+                unsigned char la_seq[128], ra_seq[128];
+                uint64_acgt(left_anchor, la_seq, k); la_seq[k] = '\0';
+                uint64_acgt(right_anchor, ra_seq, k); ra_seq[k] = '\0';
+
+                fprintf(novel_fp, "%s\t%s\t%d\t%d\t%s\n",
+                        la_seq, ra_seq, seq_len, cov, seq_buf);
+
+                // Also emit a VCF record tagged SOURCE=BACKFILL when both
+                // anchors resolve uniquely on the same reference contig.
+                if (rp_ok && lpl > 0 && rpl > 0) {
+                    uint64_t left_walk_fwd  = left_path[lpl - 1];
+                    uint64_t right_walk_fwd = right_path[rpl - 1];
+                    int emitted = emit_backfill_vcf(
+                        eva, &rpctx,
+                        left_anchor, left_walk_fwd,
+                        right_anchor, right_walk_fwd,
+                        seq_buf, seq_len, cov);
+                    if (emitted) eva->n_backfill_vcf++;
+                }
+
+                // Mark every canonical k-mer along the accepted path as used.
+                u64set_add(eva->used_kmers, y_can);
+                for (int ii = 0; ii < lpl; ii++) {
+                    u64set_add(eva->used_kmers, min_hash_key(left_path[ii], k));
+                }
+                for (int ii = 0; ii < rpl; ii++) {
+                    u64set_add(eva->used_kmers, min_hash_key(right_path[ii], k));
+                }
+                eva->n_backfill_novel++;
+                free(seq_buf);
+            } else {
+                // Contamination: cannot reach reference anchors on both sides.
+                // IMPORTANT: only the starting k-mer is flagged; the k-mers
+                // traversed by the failed walk are NOT marked, so they remain
+                // candidates in subsequent iterations of this loop. The flag
+                // is stored in contam_kmers (NOT used_kmers) so that a later
+                // walk which happens to step onto this k-mer is treated as a
+                // dead-end/continuation target rather than a valid anchor.
+                unsigned char kseq[128];
+                uint64_acgt(y_can, kseq, k); kseq[k] = '\0';
+                const char *reason;
+                if (r_left_last != 1 && r_right_last != 1) reason = "BOTH_SIDES_FAIL";
+                else if (r_right_last != 1)               reason = "RIGHT_FAIL";
+                else                                       reason = "LEFT_FAIL";
+                fprintf(contam_fp, "%s\t%d\t%s\n", kseq, cov, reason);
+                if (eva->contam_kmers != NULL) {
+                    u64set_add(eva->contam_kmers, y_can);
+                }
+                eva->n_backfill_contam++;
+            }
+        }
+    }
+
+    free(left_path);
+    free(right_path);
+    fclose(novel_fp);
+    fclose(contam_fp);
+    if (rp_ok) ref_pos_ctx_free(&rpctx);
+    fprintf(stderr,
+            "Back-fill (iter %d): unique-NGS=%d, novel=%d, contamination=%d, vcf-emitted=%d\n",
+            eva->iteration, eva->n_backfill_unique,
+            eva->n_backfill_novel, eva->n_backfill_contam,
+            eva->n_backfill_vcf);
+}
 
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
@@ -1447,26 +2206,51 @@ int main(int argc, char *argv[])
     float error_rate = 0.025f;
     int num_iters = 3;  // Default number of iterations
     int max_assem_cov = 0; // Default: no max coverage limit
+    int backfill_enabled = 1; // Back-fill of unique NGS k-mers enabled by default
+    int backfill_max_ext = 0; // 0 => use insert_size
+    int backfill_min_cov_override = 0; // 0 => use -a value
     char *output_base = NULL;
 
     ketopt_t o = KETOPT_INIT;
     int fix_enabled = 0;
     static ko_longopt_t long_options[] = {
         { "fix", ko_optional_argument, 128 },
+        { "no-backfill", ko_no_argument, 129 },
+        { "backfill-len", ko_required_argument, 130 },
+        { "backfill-min-cov", ko_required_argument, 131 },
+        { "help", ko_no_argument, 132 },
         { 0, 0, 0 }
     };
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:m:", long_options)) >= 0) { // Added 'm:'
+    while ((c = ketopt(&o, argc, argv, 1, "hk:t:c:a:l:e:o:n:m:", long_options)) >= 0) {
+        if (c == 'h' || c == 132) {
+            usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov);
+            return 0;
+        }
+        else if (c == '?' || c == ':') {
+            fprintf(stderr, "Error: invalid or incomplete option\n");
+            usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov);
+            return 1;
+        }
         if (c == 'k') k = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
-        else if (c == 'a') assem_min_cov = atoi(o.arg);  // New option for assembly min coverage
-        else if (c == 'm') max_assem_cov = atoi(o.arg); // Parse max assembly coverage
+        else if (c == 'a') assem_min_cov = atoi(o.arg);
+        else if (c == 'm') max_assem_cov = atoi(o.arg);
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
-        else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
+        else if (c == 'n') num_iters = atoi(o.arg);
         else if (c == 128) {
             fix_enabled = 1;
+        }
+        else if (c == 129) {
+            backfill_enabled = 0;
+        }
+        else if (c == 130) {
+            backfill_max_ext = atoi(o.arg);
+        }
+        else if (c == 131) {
+            backfill_min_cov_override = atoi(o.arg);
         }
         else if (c == 'o') output_base = o.arg;
     }
@@ -1507,7 +2291,7 @@ int main(int argc, char *argv[])
     
     int c_f_n = 2;
     while(c_f_n < f_num ) {
-        fprintf(stderr, "Counting NGS file %d ......\n", c_f_n );
+        fprintf(stderr, "Counting k-mers of NGS file %d ......\n", c_f_n );
         h = count_file2(argv[o.ind + c_f_n ], h, k, p, block_size, n_thread);  
         c_f_n = c_f_n + 1;
     }
@@ -1543,6 +2327,12 @@ int main(int argc, char *argv[])
     eva.low_quality_fp = NULL;
     eva.extent_recursion_depth = 0;
 
+    // Back-fill state
+    eva.used_kmers = u64set_init();
+    eva.contam_kmers = u64set_init();
+    eva.backfill_min_cov = backfill_min_cov_override > 0 ? backfill_min_cov_override : assem_min_cov;
+    eva.backfill_max_ext = backfill_max_ext > 0 ? backfill_max_ext : insert_size;
+
     char *current_ref = argv[o.ind];
     for (int iter = 1; iter <= num_iters; iter++) {
         // Open VCF output for this iteration
@@ -1555,7 +2345,7 @@ int main(int argc, char *argv[])
         }
         
         fprintf(vcf_fp, "##fileformat=VCFv4.5\n");
-        fprintf(vcf_fp, "##ProGenFixerVersion=v1.0\n");
+        fprintf(vcf_fp, "##ProGenFixerVersion=v1.1\n");
         fprintf(vcf_fp, "##ProGenFixerCommand=");
         for (int i = 0; i < argc; i++) {
             fprintf(vcf_fp, "%s%s", argv[i], (i == argc - 1) ? "" : " ");
@@ -1564,6 +2354,7 @@ int main(int argc, char *argv[])
 
         fprintf(vcf_fp, "##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description=\"K-mer coverage of the variant path\">\n");
         fprintf(vcf_fp, "##INFO=<ID=VARTYPE,Number=1,Type=String,Description=\"Variant type (INS, DEL, SUB)\">\n");
+        fprintf(vcf_fp, "##INFO=<ID=SOURCE,Number=1,Type=String,Description=\"Origin of the variant call: VARCALL (reference-anchored variant calling with path assembly) or BACKFILL (recovered from NGS-unique k-mers via greedy De Bruijn graph walk with two-sided reference anchoring)\">\n");
         fprintf(vcf_fp, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
 
         // Count current reference k-mers
@@ -1579,26 +2370,41 @@ int main(int argc, char *argv[])
         eva.hr = hr;
         eva.vcf_out = vcf_fp;
         eva.iteration = iter;
-        eva.var_count = 0;
-        eva.var_capacity = 0;
         
         // Free previous variations if any
-        if (eva.variations != NULL) {
-            free(eva.variations);
-        }
-        eva.variations = NULL;
+        free_variations(&eva);
         
         // Reset pointers to prevent dangling pointers
         eva.var_locs = NULL;
         eva.kms = NULL;
 
+        // Reset used-k-mer set at the start of each iteration: the
+        // reference changes between iterations so "unique NGS k-mers"
+        // are recomputed fresh.
+        if (eva.used_kmers != NULL) {
+            u64set_destroy(eva.used_kmers);
+        }
+        eva.used_kmers = u64set_init();
+        if (eva.contam_kmers != NULL) {
+            u64set_destroy(eva.contam_kmers);
+        }
+        eva.contam_kmers = u64set_init();
+
         // Run analysis
         fprintf(stderr, "Running analysis for iteration %d...\n", iter);
         analysis_ref_seq(&eva, current_ref, insert_size, min_cov, assem_min_cov);
+
+        // Back-fill: analyze NGS-unique k-mers that variant calling did not consume.
+        // Must run BEFORE closing vcf_fp because back-fill emits its own VCF
+        // records (tagged SOURCE=BACKFILL) into the same file.
+        if (backfill_enabled) {
+            fprintf(stderr, "Running back-fill for iteration %d...\n", iter);
+            backfill_unique_kmers(&eva, current_ref);
+        }
         fclose(vcf_fp);
 
-        // Apply corrections if we found any variations
-        if (eva.var_count > 0) {
+        // Apply corrections if requested and we found any unique variations.
+        if (fix_enabled && eva.var_count > 0) {
             char new_ref[256];
             snprintf(new_ref, sizeof(new_ref), "%s.iter%d.fasta", output_base, iter);
             fprintf(stderr, "Applying %d variations to create %s\n", eva.var_count, new_ref);
@@ -1610,15 +2416,12 @@ int main(int argc, char *argv[])
             }
             current_ref = strdup(new_ref);
             fprintf(stderr, "Next reference: %s\n", current_ref);
-        } else {
+        } else if (fix_enabled) {
             fprintf(stderr, "No variations found in iteration %d, using same reference for next iteration\n", iter);
         }
         
         // Cleanup from this iteration
-        if (eva.variations != NULL) {
-            free(eva.variations);
-            eva.variations = NULL;
-        }
+        free_variations(&eva);
         
         // Free the reference hash for this iteration
         for (int i = 0; i < (1<<p); i++) {
@@ -1636,8 +2439,14 @@ int main(int argc, char *argv[])
     free(eva.all_nodes);
     free(eva.term_nodes);
     free(eva.good_term_nodes);
-    if (eva.variations != NULL) {
-        free(eva.variations);
+    free_variations(&eva);
+    if (eva.used_kmers != NULL) {
+        u64set_destroy(eva.used_kmers);
+        eva.used_kmers = NULL;
+    }
+    if (eva.contam_kmers != NULL) {
+        u64set_destroy(eva.contam_kmers);
+        eva.contam_kmers = NULL;
     }
     // Free NGS k-mer hash
     for (int i = 0; i < (1<<p); i++) {
@@ -1657,7 +2466,7 @@ int main(int argc, char *argv[])
 void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size, float error_rate, int max_assem_cov) { // Added max_assem_cov parameter
     fprintf(stderr, "\n");
     fprintf(stderr, "ProGenFixer: an ultra-fast and accurate tool for correcting prokaryotic genome sequences using a mapping-free algorithm\n");
-    fprintf(stderr, "Version v1.0  Author: Lifu Song songlf@tib.cas.cn\n");
+    fprintf(stderr, "Version v1.1  Author: Lifu Song songlf@tib.cas.cn\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Usage: ProGenFixer [options] Reference NGS_files -o output_prefix\n");
     fprintf(stderr, "       [Supporting formats: fq, fa, fq.gz, fa.gz]\n");
@@ -1666,13 +2475,17 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
     fprintf(stderr, "  -c INT     minimal k-mer coverage for identifying variation regions [%d]\n", min_cov);
     fprintf(stderr, "  -a INT     minimal k-mer coverage for assemble-based variant calling [%d]\n", assem_min_cov);
-    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov); // Added -m description
+    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov);
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
     // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
     fprintf(stderr, "  -n INT     number of correction iterations [3]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
+    fprintf(stderr, "  -h, --help  show this help message\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
+    fprintf(stderr, "  --no-backfill       disable back-fill of NGS-unique k-mers\n");
+    fprintf(stderr, "  --backfill-len INT  max extension length per side for back-fill [uses -l]\n");
+    fprintf(stderr, "  --backfill-min-cov INT  min NGS k-mer coverage for back-fill [uses -a]\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads.fq -o results --fix\n");
@@ -1680,6 +2493,3 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -m 100 -n 3 --fix\n"); // Added example with -m
     fprintf(stderr, "\n");
 }
-
-
-
