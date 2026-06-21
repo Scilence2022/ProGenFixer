@@ -7,3 +7,5 @@ ProGenFixer
 *.dSYM/
 .qoder/
 backfill_analysis_report.md
+.local_data/
+.DS_Store

@@ -1721,12 +1721,6 @@ static int ref_pos_ctx_build(const char *path, int k, ref_pos_ctx_t *ctx) {
     return 0;
 }
 
-// Encode a uint64 k-mer (forward) into its ACGT string representation.
-// Returns seq (already null-terminated by the caller if needed).
-static inline void kmer_to_acgt(uint64_t y, int k, unsigned char *out) {
-    uint64_acgt(y, out, (unsigned char)k);
-}
-
 // Reverse-complement an ACGT string in place.
 static inline void acgt_revcomp_inplace(unsigned char *s, int n) {
     static const unsigned char cmp[128] = {
@@ -2224,18 +2218,28 @@ int main(int argc, char *argv[])
         { "no-backfill", ko_no_argument, 129 },
         { "backfill-len", ko_required_argument, 130 },
         { "backfill-min-cov", ko_required_argument, 131 },
+        { "help", ko_no_argument, 132 },
         { 0, 0, 0 }
     };
     
-    while ((c = ketopt(&o, argc, argv, 1, "k:t:c:a:l:e:o:n:m:", long_options)) >= 0) { // Added 'm:'
+    while ((c = ketopt(&o, argc, argv, 1, "hk:t:c:a:l:e:o:n:m:", long_options)) >= 0) {
+        if (c == 'h' || c == 132) {
+            usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov);
+            return 0;
+        }
+        else if (c == '?' || c == ':') {
+            fprintf(stderr, "Error: invalid or incomplete option\n");
+            usage(k, n_thread, min_cov, assem_min_cov, insert_size, error_rate, max_assem_cov);
+            return 1;
+        }
         if (c == 'k') k = atoi(o.arg);
         else if (c == 't') n_thread = atoi(o.arg);
         else if (c == 'c') min_cov = atoi(o.arg);
-        else if (c == 'a') assem_min_cov = atoi(o.arg);  // New option for assembly min coverage
-        else if (c == 'm') max_assem_cov = atoi(o.arg); // Parse max assembly coverage
+        else if (c == 'a') assem_min_cov = atoi(o.arg);
+        else if (c == 'm') max_assem_cov = atoi(o.arg);
         else if (c == 'l') insert_size = atoi(o.arg); 
         else if (c == 'e') error_rate = atof(o.arg);
-        else if (c == 'n') num_iters = atoi(o.arg);  // New option for iterations
+        else if (c == 'n') num_iters = atoi(o.arg);
         else if (c == 128) {
             fix_enabled = 1;
         }
@@ -2471,12 +2475,13 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  -k INT     k-mer size [%d]\n", k);
     fprintf(stderr, "  -c INT     minimal k-mer coverage for identifying variation regions [%d]\n", min_cov);
     fprintf(stderr, "  -a INT     minimal k-mer coverage for assemble-based variant calling [%d]\n", assem_min_cov);
-    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov); // Added -m description
+    fprintf(stderr, "  -m INT     maximal k-mer coverage for assemble-based variant calling [%d, 0=no limit]\n", max_assem_cov);
     fprintf(stderr, "  -l INT     maximal assembly length [%d]\n", insert_size);
     fprintf(stderr, "  -t INT     number of threads [%d]\n", n_thread);
     // fprintf(stderr, "  -e FLOAT   sequencing error rate for p-value calculation [%g]\n", error_rate);
     fprintf(stderr, "  -n INT     number of correction iterations [3]\n");
     fprintf(stderr, "  -o STR     base name for output files [required]\n");
+    fprintf(stderr, "  -h, --help  show this help message\n");
     fprintf(stderr, "  --fix      enable reference correction \n");
     fprintf(stderr, "  --no-backfill       disable back-fill of NGS-unique k-mers\n");
     fprintf(stderr, "  --backfill-len INT  max extension length per side for back-fill [uses -l]\n");
@@ -2488,6 +2493,3 @@ void usage(int k, int n_thread, int min_cov, int assem_min_cov, int insert_size,
     fprintf(stderr, "  ProGenFixer ref_genome.fa reads1.fq reads2.fq -o results -c 4 -a 6 -m 100 -n 3 --fix\n"); // Added example with -m
     fprintf(stderr, "\n");
 }
-
-
-
