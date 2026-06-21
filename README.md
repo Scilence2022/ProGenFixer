@@ -106,7 +106,7 @@ ProGenFixer outputs variants in VCF format (VCFv4.5 compatible). The VCF files i
 
 ```
 ##fileformat=VCFv4.5
-##ProGenFixerVersion=v1.0
+##ProGenFixerVersion=v1.1
 ##ProGenFixerCommand=[command line used]
 ##INFO=<ID=KMER_COV,Number=1,Type=Integer,Description="K-mer coverage of the variant path">
 ##INFO=<ID=VARTYPE,Number=1,Type=String,Description="Variant type (INS, DEL, SUB)">
