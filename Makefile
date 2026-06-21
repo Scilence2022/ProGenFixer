@@ -1,4 +1,4 @@
-CFLAGS=-g -Wall -Ofast 
+CFLAGS=-g -Wall -O3 -ffast-math
 CXXFLAGS=$(CFLAGS) -std=c++11
 LIBS=-lz -lm
 PROG=ProGenFixer
@@ -14,9 +14,8 @@ all:$(PROG)
 
 
 
-ProGenFixer:ProGenFixer.c khashl.h ketopt.h kseq.h kthread.h
+ProGenFixer:ProGenFixer.c kthread.c khashl.h ketopt.h kseq.h kthread.h
 	$(CC) $(CFLAGS) -o $@ ProGenFixer.c kthread.c $(LIBS) -lpthread
 
 clean:
 	rm -fr *.dSYM $(PROG)
-
