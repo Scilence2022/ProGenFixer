@@ -49,8 +49,8 @@ Where:
 ### Options
 
 - `-k INT` : k-mer size (default: 31)
-- `-c INT` : minimal reference k-mer coverage that opens a candidate variation region (default: 2)
-- `-a INT` : minimal k-mer coverage for variant calling and region-closing anchors (default: 5)
+- `-c INT` : minimal reference k-mer coverage that opens a candidate variation region (default: 3)
+- `-a INT` : minimal k-mer coverage for variant calling and region-closing anchors (default: 8)
 - `-m INT` : maximal k-mer coverage for assemble-based variant calling [0, 0=no limit]
 - `-l INT` : maximal assembly length for variant calling (default: 1000)
 - `-t INT` : number of threads for k-mer counting (default: 3)

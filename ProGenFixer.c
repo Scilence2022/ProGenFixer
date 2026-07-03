@@ -2202,7 +2202,7 @@ static void backfill_unique_kmers(evaluation_t *eva, const char *ref_path)
 // Fix memory management in main iteration loop
 int main(int argc, char *argv[])
 {
-    int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 2, assem_min_cov = 5, insert_size = 1000;
+    int c, k = 31, p = KC_BITS, block_size = 10000000, n_thread = 3, min_cov = 3, assem_min_cov = 8, insert_size = 1000;
     float error_rate = 0.025f;
     int num_iters = 3;  // Default number of iterations
     int max_assem_cov = 0; // Default: no max coverage limit
