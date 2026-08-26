@@ -146,11 +146,15 @@ This approach is particularly effective for prokaryotic genomes, which are typic
 - May not detect complex structural variations
 - Performance depends on the chosen k-mer size and coverage thresholds
 
+## Web Platform
+
+A companion web-based platform offering a ready-to-use interface is available at <https://progenfixer.biodesign.ac.cn>.
+
 ## Citation
 
 If you use ProGenFixer in your research, please cite:
 
-Song et al. (2025). ProGenFixer: an ultra-fast and accurate tool for correcting prokaryotic genome sequences using a mapping-free algorithm
+Song, L., Wang, M., Liao, X., Wu, J., Shi, Z., Wang, R., Li, H., Liu, L., He, B., Ni, X., Li, Q., Li, J., Ma, H., Zheng, P., Sun, J., & Ma, Y. (2026). ProGenFixer: An Ultrafast and Accurate Tool for Correcting Prokaryotic Genome Sequences Using a Mapping-Free Algorithm. *Computational and Structural Biotechnology Journal*, 35(1). https://doi.org/10.34133/csbj.0183
 
 ## License
 
